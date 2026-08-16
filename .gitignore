@@ -1,0 +1,12 @@
+# build output
+/dist/
+/cannabits-gateway
+*.test
+
+# real config and secrets — NEVER commit these (only the *.example files)
+/gateway.json
+/gateway.env
+gateway.local.json
+
+# local spool
+/spool/

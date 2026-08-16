@@ -1,0 +1,7 @@
+{
+  "_comment": "Agent mode: the Pi pulls each room's controller binding from the backend, so you connect the OptiClimate in the Cannabits Pro UI (host + port) and this file stays tiny. api and key come from gateway.env. Replace planId with your plan's UUID.",
+  "planId": "REPLACE_WITH_PLAN_UUID",
+  "gatewayLabel": "cannaru-pi",
+  "spoolDir": "/var/lib/cannabits-gateway/spool",
+  "configPollSeconds": 15
+}

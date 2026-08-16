@@ -1,0 +1,18 @@
+[Unit]
+Description=Cannabits Edge Gateway
+Documentation=https://github.com/neda-dvb/growgoddess-pi
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/cannabits/gateway.env
+# Agent mode: room/controller bindings come from the backend. Drop "-agent"
+# to run a static config with explicit sources instead (see README).
+ExecStart=/usr/local/bin/cannabits-gateway -config /etc/cannabits/gateway.json -agent
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
