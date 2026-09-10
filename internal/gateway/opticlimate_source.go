@@ -73,26 +73,57 @@ func (s *OptiClimateSource) Poll(now time.Time) ([]Reading, error) {
 			names = append(names, r.Name)
 		}
 	}
+	values, err := optiClimateGetValues(s.Client, s.URL, s.Address, names) // GET only - never a write
+	if err != nil {
+		return nil, err
+	}
+
+	ts := now.UTC().Format(time.RFC3339)
+	var out []Reading
+	for _, r := range s.Registers {
+		if r.Name == "" || r.Metric == "" {
+			continue
+		}
+		v, ok := values[r.Name]
+		if !ok {
+			continue // controller did not return this register
+		}
+		f, ok := numericValue(v)
+		if !ok {
+			continue // "Disconnected", null, or any non-number: skip, no error
+		}
+		out = append(out, Reading{
+			SensorID:    s.Zone + ":" + r.Metric,
+			Type:        r.Metric,
+			Ts:          ts,
+			Value:       round1(f),
+			ValueOrigin: "measured",
+		})
+	}
+	return out, nil
+}
+
+// optiClimateGetValues is the one read call both the source and the control
+// adapter use: GET getRegisterValues for the named registers, returning each
+// raw value (a JSON number, a string such as "Disconnected", or null).
+func optiClimateGetValues(client *http.Client, baseURL string, address int, names []string) (map[string]json.RawMessage, error) {
 	idsJSON, err := json.Marshal(names)
 	if err != nil {
 		return nil, fmt.Errorf("opticlimate: encode ids: %w", err)
 	}
 	endpoint := fmt.Sprintf("%s/backend/getRegisterValues?address=%d&ids=%s",
-		s.URL, s.Address, url.QueryEscape(string(idsJSON)))
-
-	client := s.Client
+		baseURL, address, url.QueryEscape(string(idsJSON)))
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
-	resp, err := client.Get(endpoint) // GET only - never a write
+	resp, err := client.Get(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("opticlimate get: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("opticlimate: HTTP %d from %s", resp.StatusCode, s.URL)
+		return nil, fmt.Errorf("opticlimate: HTTP %d from %s", resp.StatusCode, baseURL)
 	}
-
 	var payload struct {
 		GetRegisterValues struct {
 			Address int `json:"address"`
@@ -104,28 +135,9 @@ func (s *OptiClimateSource) Poll(now time.Time) ([]Reading, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return nil, fmt.Errorf("opticlimate decode: %w", err)
 	}
-
-	ts := now.UTC().Format(time.RFC3339)
-	var out []Reading
-	for _, r := range s.Registers {
-		if r.Name == "" || r.Metric == "" {
-			continue
-		}
-		v, ok := payload.GetRegisterValues.Values[r.Name]
-		if !ok {
-			continue // controller did not return this register
-		}
-		f, ok := numericValue(v.Value)
-		if !ok {
-			continue // "Disconnected", null, or any non-number: skip, no error
-		}
-		out = append(out, Reading{
-			SensorID:    s.Zone + ":" + r.Metric,
-			Type:        r.Metric,
-			Ts:          ts,
-			Value:       round1(f),
-			ValueOrigin: "measured",
-		})
+	out := make(map[string]json.RawMessage, len(payload.GetRegisterValues.Values))
+	for name, v := range payload.GetRegisterValues.Values {
+		out[name] = v.Value
 	}
 	return out, nil
 }

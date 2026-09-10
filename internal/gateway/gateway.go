@@ -197,6 +197,11 @@ type Config struct {
 	ConfigPollSeconds int            `json:"configPollSeconds,omitempty"`
 	SpoolDir          string         `json:"spoolDir"`
 	Sources           []SourceConfig `json:"sources"`
+	// AllowControl lets this gateway WRITE setpoints the platform queues for
+	// its rooms (agent mode). Off by default: a gateway that was not
+	// explicitly configured for control refuses every write command and
+	// reports "control disabled", whatever the backend asks.
+	AllowControl bool `json:"allowControl,omitempty"`
 }
 
 // Validate enforces the contract, including the honesty rule.

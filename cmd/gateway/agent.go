@@ -6,7 +6,11 @@
 // room — each streaming to its OWN zone. One Pi at the facility serves every
 // room on the LAN; adding/removing a controller in the UI takes effect on the
 // next poll, no restart. The spool, client, batch and telemetry POST are the
-// exact same proven path as static mode. Read-only: it never controls.
+// exact same proven path as static mode.
+//
+// Control: the agent also polls controller commands (test, read settings,
+// set a setpoint). Writes run only with "allowControl": true in the config;
+// see performCommand.
 package main
 
 import (
@@ -96,8 +100,8 @@ func runAgent(cfg gateway.Config, key string) {
 	}
 	const sampleEvery = 60 * time.Second // per-controller read cadence
 
-	log.Printf("gateway agent %s: plan %s, config poll %s, flush %s, spool %s",
-		cfg.GatewayLabel, cfg.PlanID, pollEvery, flushEvery, cfg.SpoolDir)
+	log.Printf("gateway agent %s: plan %s, config poll %s, flush %s, spool %s, control %s",
+		cfg.GatewayLabel, cfg.PlanID, pollEvery, flushEvery, cfg.SpoolDir, map[bool]string{true: "ENABLED", false: "disabled"}[cfg.AllowControl])
 
 	// Govee (and future cloud vendors) need a vendor API key. The agent holds
 	// it in its own environment; the backend never serves it in the config.
@@ -233,7 +237,7 @@ func runAgent(cfg gateway.Config, key string) {
 		case <-poll.C:
 			reconcile()
 		case <-cmds.C:
-			pollCommands(cfg.API, cfg.PlanID, key)
+			pollCommands(cfg.API, cfg.PlanID, key, cfg.AllowControl)
 		case <-flush.C:
 			flushNow()
 		case <-sig:
@@ -244,15 +248,24 @@ func runAgent(cfg gateway.Config, key string) {
 	}
 }
 
-// ── Test Connection: read-only controller probe on demand ──
+// ── controller commands: test, read settings, set a setpoint ──
+//
+// The platform queues commands; the agent polls them every 5s, performs each
+// on the LAN and posts the outcome. A test and a settings read are GET-only.
+// A setpoint write is the one control operation, and it runs only when this
+// gateway's config says allowControl: true; otherwise it is refused here with
+// a clear result, whatever the backend asked.
 
-type agentTest struct {
-	TestID     string          `json:"testId"`
+type agentCommand struct {
+	CommandID  string          `json:"commandId"`
+	Kind       string          `json:"kind"`
 	ZoneID     string          `json:"zoneId"`
 	Controller agentController `json:"controller"`
+	Payload    map[string]any  `json:"payload"`
+	ExpiresAt  string          `json:"expiresAt"`
 }
 
-func fetchGatewayCommands(api, planID, key string) ([]agentTest, error) {
+func fetchGatewayCommands(api, planID, key string) ([]agentCommand, error) {
 	url := fmt.Sprintf("%s/api/pro/plans/%s/gateway/commands", strings.TrimRight(api, "/"), planID)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -268,23 +281,27 @@ func fetchGatewayCommands(api, planID, key string) ([]agentTest, error) {
 		return nil, fmt.Errorf("commands HTTP %d", resp.StatusCode)
 	}
 	var out struct {
-		Tests []agentTest `json:"tests"`
+		Commands []agentCommand `json:"commands"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
 	}
-	return out.Tests, nil
+	return out.Commands, nil
+}
+
+func controllerURL(ctrl agentController) string {
+	port := ctrl.Port
+	if port == 0 {
+		port = 4001
+	}
+	return fmt.Sprintf("http://%s:%d", ctrl.Host, port)
 }
 
 // performControllerTest does the existing read-only OptiClimate read and
 // returns the canonical metrics that came back numeric. It never writes.
 func performControllerTest(ctrl agentController) ([]string, error) {
-	port := ctrl.Port
-	if port == 0 {
-		port = 4001
-	}
 	src := &gateway.OptiClimateSource{
-		Zone: "test", URL: fmt.Sprintf("http://%s:%d", ctrl.Host, port),
+		Zone: "test", URL: controllerURL(ctrl),
 		Address: ctrl.Address, Registers: gateway.OptiClimateDefaultRegisters(), Every: time.Minute,
 	}
 	rs, err := src.Poll(time.Now())
@@ -302,9 +319,9 @@ func performControllerTest(ctrl agentController) ([]string, error) {
 	return metrics, nil
 }
 
-func postGatewayResult(api, planID, key, testID string, ok bool, metrics []string, errMsg string) {
-	url := fmt.Sprintf("%s/api/pro/plans/%s/gateway/commands/%s/result", strings.TrimRight(api, "/"), planID, testID)
-	body, _ := json.Marshal(map[string]any{"ok": ok, "metrics": metrics, "error": errMsg})
+func postGatewayResult(api, planID, key, commandID string, ok bool, result map[string]any, errMsg string) {
+	url := fmt.Sprintf("%s/api/pro/plans/%s/gateway/commands/%s/result", strings.TrimRight(api, "/"), planID, commandID)
+	body, _ := json.Marshal(map[string]any{"ok": ok, "result": result, "error": errMsg})
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return
@@ -313,30 +330,101 @@ func postGatewayResult(api, planID, key, testID string, ok bool, metrics []strin
 	req.Header.Set("X-Api-Key", key)
 	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {
-		log.Printf("agent: post test result: %v", err)
+		log.Printf("agent: post result for %s: %v", commandID, err)
 		return
 	}
 	resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		log.Printf("agent: post result for %s: HTTP %d", commandID, resp.StatusCode)
+	}
 }
 
-func pollCommands(api, planID, key string) {
-	tests, err := fetchGatewayCommands(api, planID, key)
-	if err != nil {
-		return // quiet: commands poll is best-effort
+// commandExpired reports whether the platform's expiry for a command has
+// passed on this clock. A stale setpoint is never applied.
+func commandExpired(c agentCommand, now time.Time) bool {
+	if c.ExpiresAt == "" {
+		return false
 	}
-	for _, t := range tests {
-		if strings.ToLower(t.Controller.Vendor) != "opticlimate" {
-			postGatewayResult(api, planID, key, t.TestID, false, nil, "unsupported controller")
-			continue
-		}
-		metrics, err := performControllerTest(t.Controller)
+	t, err := time.Parse(time.RFC3339, c.ExpiresAt)
+	if err != nil {
+		return false
+	}
+	return now.After(t)
+}
+
+// performCommand runs one command and returns (ok, result, error message).
+// It is the single dispatch point; the allowControl gate lives here.
+func performCommand(c agentCommand, allowControl bool, now time.Time) (bool, map[string]any, string) {
+	if strings.ToLower(c.Controller.Vendor) != "opticlimate" {
+		return false, nil, "unsupported controller"
+	}
+	if commandExpired(c, now) {
+		return false, nil, "the command expired before the gateway performed it"
+	}
+	switch c.Kind {
+	case "test":
+		metrics, err := performControllerTest(c.Controller)
 		if err != nil {
-			log.Printf("agent: test %s (%s) failed: %v", t.TestID, t.Controller.Host, err)
-			postGatewayResult(api, planID, key, t.TestID, false, nil, "could not reach the controller")
-			continue
+			return false, nil, "could not reach the controller"
 		}
-		log.Printf("agent: test %s (%s) ok: %v", t.TestID, t.Controller.Host, metrics)
-		postGatewayResult(api, planID, key, t.TestID, true, metrics, "")
+		return true, map[string]any{"metrics": metrics}, ""
+	case "read_settings":
+		ctl := &gateway.OptiClimateControl{URL: controllerURL(c.Controller), Address: c.Controller.Address}
+		settings, err := ctl.ReadSettings(now)
+		if err != nil {
+			return false, nil, "could not read the controller's settings"
+		}
+		return true, map[string]any{"settings": settings}, ""
+	case "set_setpoint":
+		if !allowControl {
+			return false, nil, "control is disabled on this gateway (allowControl is off)"
+		}
+		key, _ := c.Payload["setpoint"].(string)
+		value, ok := c.Payload["value"].(float64)
+		if key == "" || !ok {
+			return false, nil, "malformed setpoint command"
+		}
+		ctl := &gateway.OptiClimateControl{URL: controllerURL(c.Controller), Address: c.Controller.Address}
+		res, err := ctl.SetSetpoint(key, value)
+		if err != nil {
+			return false, nil, err.Error()
+		}
+		return true, map[string]any{
+			"setpoint": res.Setpoint, "register": res.Register,
+			"previous": res.Previous, "value": res.Value, "readback": res.Readback,
+		}, ""
+	}
+	return false, nil, "unknown command kind " + c.Kind
+}
+
+var lastCommandsPollError time.Time
+
+func pollCommands(api, planID, key string, allowControl bool) {
+	cmds, err := fetchGatewayCommands(api, planID, key)
+	if err != nil {
+		// the poll runs every 5s; log a failing backend once a minute, not 12 times
+		if time.Since(lastCommandsPollError) > time.Minute {
+			log.Printf("agent: commands poll: %v", err)
+			lastCommandsPollError = time.Now()
+		}
+		return
+	}
+	for _, c := range cmds {
+		now := time.Now()
+		ok, result, errMsg := performCommand(c, allowControl, now)
+		switch {
+		case c.Kind == "set_setpoint" && ok:
+			log.Printf("CONTROL: %s zone %s %s -> %s %v (was %v, read back %v) [%s]",
+				c.Controller.Host, c.ZoneID, result["setpoint"], result["register"], result["value"], result["previous"], result["readback"], c.CommandID)
+		case c.Kind == "set_setpoint":
+			log.Printf("CONTROL REFUSED: %s zone %s %v=%v: %s [%s]",
+				c.Controller.Host, c.ZoneID, c.Payload["setpoint"], c.Payload["value"], errMsg, c.CommandID)
+		case ok:
+			log.Printf("agent: %s %s (%s) ok [%s]", c.Kind, c.ZoneID, c.Controller.Host, c.CommandID)
+		default:
+			log.Printf("agent: %s %s (%s) failed: %s [%s]", c.Kind, c.ZoneID, c.Controller.Host, errMsg, c.CommandID)
+		}
+		postGatewayResult(api, planID, key, c.CommandID, ok, result, errMsg)
 	}
 }
 

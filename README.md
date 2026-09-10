@@ -3,8 +3,9 @@
 The small Go program that runs **on a Raspberry Pi inside the facility**. It
 reads the local climate controller (OptiClimate/Revomax over HTTP, or a passive
 RS485 Modbus tap, or an I²C sensor), spools every batch to disk, and streams it
-**out** to the public Cannabits backend over HTTPS. Read-only by design: it
-measures, it never controls anything.
+**out** to the public Cannabits backend over HTTPS. It measures; it writes a
+setpoint only when the operator asks in Grow Goddess Pro AND this gateway is
+configured with `allowControl: true` (see Control below).
 
 ```
 OptiClimate / device  ──LAN──▶  Raspberry Pi  ──HTTPS──▶  Cannabits backend  ──▶  pro_readings  ──▶  Cannabits Pro (from anywhere)
@@ -78,6 +79,26 @@ and port) and never touch the Pi again:
 
 The OptiClimate register map (`Room1Temp → air_temp`, `Humidity → rh`, setpoints)
 is built into the adapter, so agent mode needs no register configuration.
+
+### Control (setpoint writes)
+
+Since 2026-09-10 the gateway can also WRITE the four room setpoints
+(temperature and humidity, day and night) that an operator changes in
+Grow Goddess Pro. The platform queues a command; the gateway polls it (every
+5 s, the same poll as Test Connection), checks the value against the
+controller's own alarm limits, writes ONE register with
+`POST /backend/setRegisterValues`, reads it back, and reports the outcome.
+Nothing is written unless `gateway.json` says so:
+
+```json
+{ "allowControl": true }
+```
+
+With the flag off (the default) every write command is refused with
+"control is disabled on this gateway" and logged. Every performed write is
+logged as `CONTROL: <host> zone <room> <setpoint> -> <register> <value> (was
+<previous>, read back <value>)`. Commands the platform queued more than two
+minutes ago are never applied.
 
 <details>
 <summary>Static mode (explicit sources, no backend config poll)</summary>
