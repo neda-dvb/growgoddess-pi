@@ -55,6 +55,10 @@ func OptiClimateDefaultRegisters() []ModbusRegisterMap {
 		{Name: "CO2Enable"}, // guard only, never emitted
 		{Name: "CO2Setpoint", Metric: "co2_setpoint", OnlyWhenTrue: "CO2Enable"},
 		{Name: "CO2OutDig", Metric: "co2_dosing_state", Boolean: true, OnlyWhenTrue: "CO2Enable"},
+		// the light cell: on/off as the controller judges it, and its relative
+		// level in percent (not PPFD, not lux; the cell's own scale)
+		{Name: "LightCell", Metric: "light_state", Boolean: true},
+		{Name: "LightSensor", Metric: "light_level"},
 	}
 }
 

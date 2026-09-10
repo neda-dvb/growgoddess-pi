@@ -184,3 +184,34 @@ func TestOptiClimateCO2Gating(t *testing.T) {
 		})
 	}
 }
+
+// TestOptiClimateLightCell: the light cell streams on/off as 1/0 and its
+// relative level; a dark room reads 0 and off, honestly, not "absent".
+func TestOptiClimateLightCell(t *testing.T) {
+	for _, tc := range []struct {
+		payload string
+		state   float64
+		level   float64
+	}{
+		{`{"getRegisterValues":{"address":0,"values":{"LightCell":{"value":true},"LightSensor":{"value":66.27}}}}`, 1, 66.3},
+		{`{"getRegisterValues":{"address":0,"values":{"LightCell":{"value":false},"LightSensor":{"value":0.0}}}}`, 0, 0},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(tc.payload))
+		}))
+		src := &OptiClimateSource{Zone: "room-1", URL: srv.URL, Every: time.Minute, Client: srv.Client(), Registers: OptiClimateDefaultRegisters()}
+		readings, err := src.Poll(time.Now())
+		srv.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]float64{}
+		for _, r := range readings {
+			got[r.Type] = r.Value
+		}
+		if len(got) != 2 || got["light_state"] != tc.state || got["light_level"] != tc.level {
+			t.Fatalf("emitted %v, want light_state=%g light_level=%g", got, tc.state, tc.level)
+		}
+	}
+}
