@@ -124,6 +124,16 @@ Other source types: `sht31` (I²C), `modbus-listen` (passive RS485 tap;
 `-modbus-inspect` maps the bus first), `sim` (fixture data for a dry run).
 </details>
 
+### Discovery and re-find
+
+"Find on the network" in the Pro connect dialog makes this gateway scan its
+own /24 for boxes answering the OptiClimate API (read-only, about 3 s) and
+report each with its MAC and live readings. Bindings remember the MAC; when
+a box stops answering for three polls the gateway rescans and, if the MAC
+answers on another address, reports the move so the room follows it. Logged
+as `agent: discovery scanned N hosts ...`, `agent: learned MAC ...` and
+`agent: controller for zone X moved: A -> B`.
+
 ## Verify from a different network (phone hotspot)
 
 1. On the Pi: `journalctl -u cannabits-gateway -f` shows `sent ...: N stored`

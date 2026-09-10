@@ -15,6 +15,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -33,6 +34,21 @@ type agentController struct {
 	Host    string `json:"host"`
 	Port    int    `json:"port"`
 	Address int    `json:"address"`
+	// MAC is the box's hardware address as the platform stores it (learned
+	// from this gateway). It is identity, not target: a binding whose MAC
+	// changes while host/port/address stay is the same running source.
+	MAC string `json:"mac"`
+}
+
+// sameTarget reports whether two bindings reach the same box the same way.
+func sameTarget(a, b agentController) bool {
+	return a.Vendor == b.Vendor && a.Host == b.Host && a.Port == b.Port && a.Address == b.Address
+}
+
+// sourceHealth is one poll outcome of a room's controller source.
+type sourceHealth struct {
+	zone string
+	ok   bool
 }
 
 type agentRoom struct {
@@ -108,11 +124,17 @@ func runAgent(cfg gateway.Config, key string) {
 	goveeKey := strings.TrimSpace(os.Getenv("GOVEE_API_KEY"))
 
 	readings := make(chan []gateway.Reading, 64)
+	health := make(chan sourceHealth, 64)
 	type running struct {
 		ctrl agentController
 		stop chan struct{}
 	}
 	active := map[string]*running{}
+	// MAC learning + re-find: which zones already reported a learned MAC, how
+	// many polls in a row failed per zone, and when a zone was last rescanned.
+	learned := map[string]bool{}
+	fails := map[string]int{}
+	lastRescan := map[string]time.Time{}
 	type runningDevice struct {
 		dev  agentDevice
 		stop chan struct{}
@@ -131,12 +153,16 @@ func runAgent(cfg gateway.Config, key string) {
 				want[r.ZoneID] = *r.Controller
 			}
 		}
-		// stop sources that were removed or whose controller changed
+		// stop sources that were removed or whose controller changed; a binding
+		// that only gained a MAC keeps running and adopts it
 		for zone, run := range active {
-			if w, ok := want[zone]; !ok || w != run.ctrl {
+			if w, ok := want[zone]; !ok || !sameTarget(w, run.ctrl) {
 				close(run.stop)
 				delete(active, zone)
+				delete(fails, zone)
 				log.Printf("agent: stopped source for zone %s", zone)
+			} else if w.MAC != run.ctrl.MAC {
+				run.ctrl = w
 			}
 		}
 		// start sources for newly connected rooms
@@ -157,7 +183,13 @@ func runAgent(cfg gateway.Config, key string) {
 			}
 			stop := make(chan struct{})
 			active[zone] = &running{ctrl: w, stop: stop}
-			go runSourceLoop(src, readings, stop)
+			z := zone
+			go runSourceLoop(src, readings, stop, func(ok bool) {
+				select {
+				case health <- sourceHealth{zone: z, ok: ok}:
+				default:
+				}
+			})
 			log.Printf("agent: streaming %s -> zone %s", src.URL, zone)
 		}
 
@@ -196,7 +228,7 @@ func runAgent(cfg gateway.Config, key string) {
 			}
 			stop := make(chan struct{})
 			activeDevices[id] = &runningDevice{dev: d, stop: stop}
-			go runSourceLoop(src, readings, stop)
+			go runSourceLoop(src, readings, stop, nil)
 			log.Printf("agent: streaming Govee %s -> room %s / zone %s", d.SKU, d.RoomID, d.ZoneID)
 		}
 	}
@@ -234,6 +266,30 @@ func runAgent(cfg gateway.Config, key string) {
 		select {
 		case rs := <-readings:
 			pending = append(pending, rs...)
+			// first readings from a box whose MAC the platform does not know
+			// yet: the neighbour table has it now, report it once
+			if len(rs) > 0 {
+				zone := strings.SplitN(rs[0].SensorID, ":", 2)[0]
+				if run, ok := active[zone]; ok && run.ctrl.MAC == "" && !learned[zone] {
+					if mac := gateway.MACFor(run.ctrl.Host); mac != "" {
+						learned[zone] = true
+						go postControllerLearned(cfg.API, cfg.PlanID, key, zone, run.ctrl.Host, mac)
+					}
+				}
+			}
+		case h := <-health:
+			if h.ok {
+				fails[h.zone] = 0
+				continue
+			}
+			fails[h.zone]++
+			// three polls in a row lost: if the platform knows the box's MAC,
+			// look for it on the LAN (at most every 5 minutes per room)
+			run, ok := active[h.zone]
+			if ok && fails[h.zone] >= 3 && run.ctrl.MAC != "" && time.Since(lastRescan[h.zone]) > 5*time.Minute {
+				lastRescan[h.zone] = time.Now()
+				go refindController(cfg.API, cfg.PlanID, key, h.zone, run.ctrl)
+			}
 		case <-poll.C:
 			reconcile()
 		case <-cmds.C:
@@ -339,6 +395,51 @@ func postGatewayResult(api, planID, key, commandID string, ok bool, result map[s
 	}
 }
 
+// postControllerLearned tells the platform the hardware address of a bound
+// box, so the room can be found again if its IP ever changes.
+func postControllerLearned(api, planID, key, zone, host, mac string) {
+	postControllerJSON(api, planID, key, "learned", map[string]any{"zoneId": zone, "host": host, "mac": mac})
+	log.Printf("agent: learned MAC %s for zone %s (%s)", mac, zone, host)
+}
+
+func postControllerJSON(api, planID, key, what string, body map[string]any) {
+	url := fmt.Sprintf("%s/api/pro/plans/%s/gateway/controllers/%s", strings.TrimRight(api, "/"), planID, what)
+	raw, _ := json.Marshal(body)
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Api-Key", key)
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		log.Printf("agent: report %s: %v", what, err)
+		return
+	}
+	resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		log.Printf("agent: report %s: HTTP %d", what, resp.StatusCode)
+	}
+}
+
+// refindController scans the LAN for a room's box by MAC after its address
+// stopped answering, and reports the new address. The platform updates the
+// binding; the next config poll restarts the source at the new host.
+func refindController(api, planID, key, zone string, ctrl agentController) {
+	hosts, _ := gateway.LocalIPv4Hosts()
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	res := gateway.DiscoverOptiClimate(ctx, hosts, 4001, 400*time.Millisecond, 64)
+	for _, c := range res.Controllers {
+		if c.MAC != "" && c.MAC == ctrl.MAC && c.Host != ctrl.Host {
+			log.Printf("agent: controller for zone %s moved: %s -> %s (MAC %s)", zone, ctrl.Host, c.Host, c.MAC)
+			postControllerJSON(api, planID, key, "moved", map[string]any{"zoneId": zone, "mac": c.MAC, "host": c.Host, "port": c.Port})
+			return
+		}
+	}
+	log.Printf("agent: zone %s: %s not answering and no box with MAC %s found among %d controller(s)", zone, ctrl.Host, ctrl.MAC, len(res.Controllers))
+}
+
 // commandExpired reports whether the platform's expiry for a command has
 // passed on this clock. A stale setpoint is never applied.
 func commandExpired(c agentCommand, now time.Time) bool {
@@ -358,6 +459,9 @@ func performCommand(c agentCommand, allowControl bool, now time.Time) (bool, map
 	if strings.ToLower(c.Controller.Vendor) != "opticlimate" {
 		return false, nil, "unsupported controller"
 	}
+	if c.Kind != "discover" && c.Controller.Host == "" {
+		return false, nil, "no controller address"
+	}
 	if commandExpired(c, now) {
 		return false, nil, "the command expired before the gateway performed it"
 	}
@@ -367,7 +471,19 @@ func performCommand(c agentCommand, allowControl bool, now time.Time) (bool, map
 		if err != nil {
 			return false, nil, "could not reach the controller"
 		}
-		return true, map[string]any{"metrics": metrics}, ""
+		result := map[string]any{"metrics": metrics}
+		if mac := gateway.MACFor(c.Controller.Host); mac != "" {
+			result["mac"] = mac
+		}
+		return true, result, ""
+	case "discover":
+		hosts, subnets := gateway.LocalIPv4Hosts()
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+		defer cancel()
+		res := gateway.DiscoverOptiClimate(ctx, hosts, 4001, 400*time.Millisecond, 64)
+		res.Subnets = subnets
+		log.Printf("agent: discovery scanned %d hosts on %v in %d ms, found %d controller(s)", res.ScannedHosts, subnets, res.DurationMs, len(res.Controllers))
+		return true, map[string]any{"controllers": res.Controllers, "scannedHosts": res.ScannedHosts, "durationMs": res.DurationMs, "subnets": res.Subnets}, ""
 	case "read_settings":
 		ctl := &gateway.OptiClimateControl{URL: controllerURL(c.Controller), Address: c.Controller.Address}
 		settings, err := ctl.ReadSettings(now)
@@ -430,11 +546,14 @@ func pollCommands(api, planID, key string, allowControl bool) {
 
 // runSourceLoop samples one source on its cadence into the shared channel
 // until told to stop (when its room's controller is removed or changed).
-func runSourceLoop(s gateway.Source, out chan<- []gateway.Reading, stop <-chan struct{}) {
+func runSourceLoop(s gateway.Source, out chan<- []gateway.Reading, stop <-chan struct{}, report func(ok bool)) {
 	tick := time.NewTicker(s.Interval())
 	defer tick.Stop()
 	poll := func() {
 		rs, err := s.Poll(time.Now())
+		if report != nil {
+			report(err == nil)
+		}
 		if err != nil {
 			log.Printf("%s: %v", s.Describe(), err)
 			return

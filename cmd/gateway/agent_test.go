@@ -37,6 +37,27 @@ func TestPerformCommandGates(t *testing.T) {
 	}
 }
 
+// TestSameTarget: a binding that only gained its MAC is the same running
+// source; a changed host is not.
+func TestSameTarget(t *testing.T) {
+	a := agentController{Vendor: "opticlimate", Host: "192.168.2.110", Port: 4001}
+	b := a
+	b.MAC = "24:18:c6:20:89:91"
+	if !sameTarget(a, b) {
+		t.Error("a learned MAC must not restart the source")
+	}
+	c := a
+	c.Host = "192.168.2.114"
+	if sameTarget(a, c) {
+		t.Error("a new host is a new target")
+	}
+	// a discover command needs no host; every other kind does
+	now := time.Now()
+	if ok, _, msg := performCommand(agentCommand{Kind: "read_settings", Controller: agentController{Vendor: "opticlimate"}}, true, now); ok || msg != "no controller address" {
+		t.Errorf("read_settings without a host must be refused, got %v %q", ok, msg)
+	}
+}
+
 func TestCommandExpired(t *testing.T) {
 	now := time.Date(2026, 9, 10, 16, 0, 0, 0, time.UTC)
 	if commandExpired(agentCommand{}, now) {
