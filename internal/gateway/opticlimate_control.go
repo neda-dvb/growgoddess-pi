@@ -57,6 +57,25 @@ type OptiClimateControl struct {
 	URL     string // controller base URL, e.g. http://192.168.2.110:4001
 	Address int
 	Client  *http.Client // nil: a fresh client with a 10s timeout
+	// The controller applies a write asynchronously: the web box accepts the
+	// POST at once and forwards it to the unit, and a GET issued right after
+	// still returns the old value (observed live: 29 read 97 ms after 27 was
+	// written, 27 from about a second later). The read-back therefore polls
+	// ReadbackAttempts times, ReadbackDelay apart, until the value matches.
+	// Zero means the defaults: 8 attempts, 1.5 s apart (12 s in total).
+	ReadbackAttempts int
+	ReadbackDelay    time.Duration
+}
+
+func (c *OptiClimateControl) readbackPlan() (int, time.Duration) {
+	attempts, delay := c.ReadbackAttempts, c.ReadbackDelay
+	if attempts <= 0 {
+		attempts = 8
+	}
+	if delay <= 0 {
+		delay = 1500 * time.Millisecond
+	}
+	return attempts, delay
 }
 
 func (c *OptiClimateControl) client() *http.Client {
@@ -179,15 +198,25 @@ func (c *OptiClimateControl) SetSetpoint(key string, value float64) (WriteResult
 		return WriteResult{}, fmt.Errorf("controller refused the write: %s", msg)
 	}
 
-	after, err := optiClimateGetValues(c.client(), c.URL, c.Address, []string{reg})
-	if err != nil {
-		return WriteResult{}, fmt.Errorf("written, but read-back failed: %w", err)
+	// read-back: the unit applies the write asynchronously, so poll until it
+	// reports the new value or the attempts run out
+	attempts, delay := c.readbackPlan()
+	var last string
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(delay)
+		}
+		after, err := optiClimateGetValues(c.client(), c.URL, c.Address, []string{reg})
+		if err != nil {
+			last = "unreadable (" + err.Error() + ")"
+			continue
+		}
+		last = strings.TrimSpace(string(after[reg]))
+		if readback, ok := numericValue(after[reg]); ok && readback == value {
+			return WriteResult{Setpoint: key, Register: reg, Previous: previous, Value: value, Readback: readback}, nil
+		}
 	}
-	readback, ok := numericValue(after[reg])
-	if !ok || readback != value {
-		return WriteResult{}, fmt.Errorf("controller reports %s after writing %g", strings.TrimSpace(string(after[reg])), value)
-	}
-	return WriteResult{Setpoint: key, Register: reg, Previous: previous, Value: value, Readback: readback}, nil
+	return WriteResult{}, fmt.Errorf("controller still reports %s after writing %g", last, value)
 }
 
 // requestErrorText flattens the controller's requestError (an array of

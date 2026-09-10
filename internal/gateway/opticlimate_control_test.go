@@ -16,12 +16,18 @@ import (
 // well-formed POST updates it (unless refuse is set), exactly like the real
 // HMI backend behaves.
 type fakeOptiClimate struct {
-	mu       sync.Mutex
-	regs     map[string]any
-	refuse   string // non-empty: every write answers requestError
-	ignore   bool   // accept the write but do not change the register
-	posts    int
-	lastBody string
+	mu     sync.Mutex
+	regs   map[string]any
+	refuse string // non-empty: every write answers requestError
+	ignore bool   // accept the write but do not change the register
+	// applyAfter: the unit applies the write only once this many GETs have
+	// happened since the POST (the real controller answers the first GET with
+	// the old value). pendingRegs holds the value until then.
+	applyAfter  int
+	getsSince   int
+	pendingRegs map[string]float64
+	posts       int
+	lastBody    string
 }
 
 func (f *fakeOptiClimate) handler(t *testing.T) http.HandlerFunc {
@@ -36,6 +42,15 @@ func (f *fakeOptiClimate) handler(t *testing.T) http.HandlerFunc {
 			}
 			var ids []string
 			_ = json.Unmarshal([]byte(r.URL.Query().Get("ids")), &ids)
+			if len(f.pendingRegs) > 0 {
+				f.getsSince++
+				if f.getsSince >= f.applyAfter {
+					for k, v := range f.pendingRegs {
+						f.regs[k] = v
+					}
+					f.pendingRegs = nil
+				}
+			}
 			values := map[string]map[string]any{}
 			for _, id := range ids {
 				if v, ok := f.regs[id]; ok {
@@ -64,7 +79,13 @@ func (f *fakeOptiClimate) handler(t *testing.T) http.HandlerFunc {
 				_ = json.NewEncoder(w).Encode(map[string]any{"setRegisterValues": map[string]any{"requestError": []string{f.refuse}}})
 				return
 			}
-			if !f.ignore {
+			if !f.ignore && f.applyAfter > 0 {
+				f.pendingRegs = map[string]float64{}
+				for k, v := range body.Values {
+					f.pendingRegs[k] = v
+				}
+				f.getsSince = 0
+			} else if !f.ignore {
 				for k, v := range body.Values {
 					f.regs[k] = v
 				}
@@ -168,14 +189,40 @@ func TestOptiClimateControlControllerRefusal(t *testing.T) {
 	}
 }
 
+// The real unit applies a write asynchronously: the GET right after the POST
+// still shows the old value. The read-back must wait for it.
+func TestOptiClimateControlAsyncApply(t *testing.T) {
+	f := newFake()
+	f.applyAfter = 3 // old value on the first two read-backs, new on the third
+	srv := httptest.NewServer(f.handler(t))
+	defer srv.Close()
+	ctl := &OptiClimateControl{URL: srv.URL, Client: srv.Client(), ReadbackAttempts: 5, ReadbackDelay: 5 * time.Millisecond}
+	res, err := ctl.SetSetpoint("temp_day", 27)
+	if err != nil {
+		t.Fatalf("a write the unit applies a moment later must be confirmed, got %v", err)
+	}
+	if res.Previous != 29 || res.Readback != 27 || f.posts != 1 {
+		t.Fatalf("result = %+v posts=%d", res, f.posts)
+	}
+	// and when it never applies within the attempts, the last value is reported
+	f2 := newFake()
+	f2.applyAfter = 10
+	srv2 := httptest.NewServer(f2.handler(t))
+	defer srv2.Close()
+	ctl2 := &OptiClimateControl{URL: srv2.URL, Client: srv2.Client(), ReadbackAttempts: 3, ReadbackDelay: 5 * time.Millisecond}
+	if _, err := ctl2.SetSetpoint("temp_day", 27); err == nil || !strings.Contains(err.Error(), "still reports 29 after writing 27") {
+		t.Fatalf("exhausted read-back must report the last value, got %v", err)
+	}
+}
+
 func TestOptiClimateControlReadbackMismatch(t *testing.T) {
 	f := newFake()
 	f.ignore = true // controller says ok but keeps the old value
 	srv := httptest.NewServer(f.handler(t))
 	defer srv.Close()
-	ctl := &OptiClimateControl{URL: srv.URL, Client: srv.Client()}
+	ctl := &OptiClimateControl{URL: srv.URL, Client: srv.Client(), ReadbackAttempts: 2, ReadbackDelay: time.Millisecond}
 	_, err := ctl.SetSetpoint("temp_day", 28)
-	if err == nil || !strings.Contains(err.Error(), "reports 29 after writing 28") {
+	if err == nil || !strings.Contains(err.Error(), "still reports 29 after writing 28") {
 		t.Fatalf("read-back mismatch must be an error, got %v", err)
 	}
 }
