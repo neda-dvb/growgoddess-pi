@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -133,6 +134,7 @@ func runAgent(cfg gateway.Config, key string) {
 	// MAC learning + re-find: which zones already reported a learned MAC, how
 	// many polls in a row failed per zone, and when a zone was last rescanned.
 	learned := map[string]bool{}
+	reportedCaps := map[string]string{} // zone -> signature of the last capabilities report
 	fails := map[string]int{}
 	lastRescan := map[string]time.Time{}
 	type runningDevice struct {
@@ -266,14 +268,23 @@ func runAgent(cfg gateway.Config, key string) {
 		select {
 		case rs := <-readings:
 			pending = append(pending, rs...)
-			// first readings from a box whose MAC the platform does not know
-			// yet: the neighbour table has it now, report it once
+			// readings from a bound box tell the platform two things once (and
+			// again whenever they change): the box's MAC, and what it can do,
+			// observed, never assumed (the metrics that actually answered, and
+			// whether THIS gateway will write setpoints)
 			if len(rs) > 0 {
 				zone := strings.SplitN(rs[0].SensorID, ":", 2)[0]
-				if run, ok := active[zone]; ok && run.ctrl.MAC == "" && !learned[zone] {
-					if mac := gateway.MACFor(run.ctrl.Host); mac != "" {
-						learned[zone] = true
-						go postControllerLearned(cfg.API, cfg.PlanID, key, zone, run.ctrl.Host, mac)
+				if run, ok := active[zone]; ok {
+					caps := observedCapabilities(rs, cfg.AllowControl)
+					sig := strings.Join(caps.Read, ",") + "|" + strings.Join(caps.Write, ",")
+					mac := run.ctrl.MAC
+					if mac == "" {
+						mac = gateway.MACFor(run.ctrl.Host)
+					}
+					if (mac != "" && run.ctrl.MAC == "" && !learned[zone]) || reportedCaps[zone] != sig {
+						learned[zone] = mac != ""
+						reportedCaps[zone] = sig
+						go postControllerLearned(cfg.API, cfg.PlanID, key, zone, run.ctrl.Host, mac, caps)
 					}
 				}
 			}
@@ -395,11 +406,44 @@ func postGatewayResult(api, planID, key, commandID string, ok bool, result map[s
 	}
 }
 
+// controllerCapabilities is what the platform stores as observed abilities.
+type controllerCapabilities struct {
+	Read    []string `json:"read"`
+	Write   []string `json:"write"`
+	Unknown []string `json:"unknown,omitempty"`
+	Control bool     `json:"control"`
+}
+
+// observedCapabilities derives a box's abilities from one poll: the metrics
+// that answered are what it reads; the setpoints are writable only when this
+// gateway runs with allowControl; the CO2 setpoint register is known to the
+// adapter but has never been written, so it stays unknown.
+func observedCapabilities(rs []gateway.Reading, allowControl bool) controllerCapabilities {
+	seen := map[string]bool{}
+	var read []string
+	for _, r := range rs {
+		if !seen[r.Type] {
+			seen[r.Type] = true
+			read = append(read, r.Type)
+		}
+	}
+	sort.Strings(read)
+	caps := controllerCapabilities{Read: read, Write: []string{}, Unknown: []string{"co2_setpoint"}, Control: allowControl}
+	if allowControl {
+		for k := range gateway.OptiClimateSetpointRegisters {
+			caps.Write = append(caps.Write, k)
+		}
+		sort.Strings(caps.Write)
+	}
+	return caps
+}
+
 // postControllerLearned tells the platform the hardware address of a bound
-// box, so the room can be found again if its IP ever changes.
-func postControllerLearned(api, planID, key, zone, host, mac string) {
-	postControllerJSON(api, planID, key, "learned", map[string]any{"zoneId": zone, "host": host, "mac": mac})
-	log.Printf("agent: learned MAC %s for zone %s (%s)", mac, zone, host)
+// box (so the room can be found again if its IP changes) and what the box
+// was observed to do.
+func postControllerLearned(api, planID, key, zone, host, mac string, caps controllerCapabilities) {
+	postControllerJSON(api, planID, key, "learned", map[string]any{"zoneId": zone, "host": host, "mac": mac, "capabilities": caps})
+	log.Printf("agent: learned zone %s (%s): MAC %q, reads %v, control %v", zone, host, mac, caps.Read, caps.Control)
 }
 
 func postControllerJSON(api, planID, key, what string, body map[string]any) {

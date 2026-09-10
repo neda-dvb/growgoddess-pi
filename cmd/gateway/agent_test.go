@@ -1,8 +1,11 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/neda-dvb/growgoddess-pi/internal/gateway"
 )
 
 // TestPerformCommandGates pins the two gates that need no controller: a
@@ -71,5 +74,22 @@ func TestCommandExpired(t *testing.T) {
 	}
 	if commandExpired(agentCommand{ExpiresAt: "2026-09-10T16:00:01Z"}, now) {
 		t.Error("a future expiry is not expired")
+	}
+}
+
+// TestObservedCapabilities: reads are what answered, writes exist only with
+// allowControl, the CO2 setpoint stays unknown either way.
+func TestObservedCapabilities(t *testing.T) {
+	rs := []gateway.Reading{{Type: "rh"}, {Type: "air_temp"}, {Type: "rh"}, {Type: "temp_setpoint"}}
+	off := observedCapabilities(rs, false)
+	if strings.Join(off.Read, ",") != "air_temp,rh,temp_setpoint" || len(off.Write) != 0 || off.Control {
+		t.Fatalf("control off: %+v", off)
+	}
+	on := observedCapabilities(rs, true)
+	if strings.Join(on.Write, ",") != "rh_day,rh_night,temp_day,temp_night" || !on.Control {
+		t.Fatalf("control on: %+v", on)
+	}
+	if strings.Join(on.Unknown, ",") != "co2_setpoint" {
+		t.Fatalf("unknown = %v", on.Unknown)
 	}
 }
