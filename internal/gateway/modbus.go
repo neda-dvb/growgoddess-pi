@@ -244,6 +244,15 @@ type ModbusRegisterMap struct {
 	// below zero).
 	Signed bool   `json:"signed,omitempty"`
 	Probe  string `json:"probe,omitempty"`
+	// Boolean marks an HTTP register whose value is JSON true/false; it is
+	// emitted as 1/0 (the registry's state metrics). Ignored by the Modbus
+	// decoder.
+	Boolean bool `json:"boolean,omitempty"`
+	// OnlyWhenTrue names another register of the same poll that must read
+	// JSON true for this one to be emitted at all: a CO2 setpoint or dosing
+	// state means nothing while the controller's CO2 function is disabled.
+	// The guard register is requested but never emitted by itself.
+	OnlyWhenTrue string `json:"onlyWhenTrue,omitempty"`
 }
 
 // Physical converts an observed raw value.

@@ -38,12 +38,23 @@ import (
 // OptiClimateDefaultRegisters is the known OptiClimate/Revomax register→metric
 // mapping. The adapter owns it, so the operator never enters register names:
 // binding an OptiClimate controller to a room is enough. Read-only.
+//
+// CO2: the controller has a CO2 input (CO2In), a CO2 setpoint and a dosing
+// output, but only when a CO2 sensor is connected AND the CO2 function is
+// enabled do they mean anything. CO2In reads "Disconnected" without a sensor
+// (skipped like any non-number); the setpoint and the dosing state are
+// emitted only while CO2Enable is true, so a facility never sees a factory
+// default setpoint of 400 ppm or a "dosing" flag for a function that is off.
 func OptiClimateDefaultRegisters() []ModbusRegisterMap {
 	return []ModbusRegisterMap{
 		{Name: "Room1Temp", Metric: "air_temp"},
 		{Name: "Humidity", Metric: "rh"},
 		{Name: "Room1TempWntdDay", Metric: "temp_setpoint"},
 		{Name: "HumiSetPointDay", Metric: "rh_setpoint"},
+		{Name: "CO2In", Metric: "co2"},
+		{Name: "CO2Enable"}, // guard only, never emitted
+		{Name: "CO2Setpoint", Metric: "co2_setpoint", OnlyWhenTrue: "CO2Enable"},
+		{Name: "CO2OutDig", Metric: "co2_dosing_state", Boolean: true, OnlyWhenTrue: "CO2Enable"},
 	}
 }
 
@@ -84,12 +95,23 @@ func (s *OptiClimateSource) Poll(now time.Time) ([]Reading, error) {
 		if r.Name == "" || r.Metric == "" {
 			continue
 		}
+		if r.OnlyWhenTrue != "" && !boolValue(values[r.OnlyWhenTrue]) {
+			continue // the function this register belongs to is disabled
+		}
 		v, ok := values[r.Name]
 		if !ok {
 			continue // controller did not return this register
 		}
-		f, ok := numericValue(v)
-		if !ok {
+		var f float64
+		if r.Boolean {
+			if !isBool(v) {
+				continue
+			}
+			f = 0
+			if boolValue(v) {
+				f = 1
+			}
+		} else if f, ok = numericValue(v); !ok {
 			continue // "Disconnected", null, or any non-number: skip, no error
 		}
 		out = append(out, Reading{
@@ -101,6 +123,19 @@ func (s *OptiClimateSource) Poll(now time.Time) ([]Reading, error) {
 		})
 	}
 	return out, nil
+}
+
+// isBool reports whether a raw register value is JSON true or false.
+func isBool(raw json.RawMessage) bool {
+	var b bool
+	return json.Unmarshal(raw, &b) == nil
+}
+
+// boolValue is true only for JSON true; anything else (false, null, a
+// number, a string, absent) is false.
+func boolValue(raw json.RawMessage) bool {
+	var b bool
+	return json.Unmarshal(raw, &b) == nil && b
 }
 
 // optiClimateGetValues is the one read call both the source and the control
