@@ -77,8 +77,13 @@ and port) and never touch the Pi again:
 }
 ```
 
-The OptiClimate register map (`Room1Temp → air_temp`, `Humidity → rh`, setpoints)
-is built into the adapter, so agent mode needs no register configuration.
+The OptiClimate register map is built into the adapter, so agent mode needs no
+register configuration. Per room it streams, once a minute: air temperature,
+humidity, the setpoint pair the controller is actually holding (day or night,
+by its program), lights on/off and the light cell's level, and CO₂ with its
+setpoint and dosing state once a CO₂ sensor answers and the CO₂ function is
+enabled on the box. Every controller call opens its own connection and closes
+it; the boxes drop idle Wi-Fi connections silently.
 
 ### Control (setpoint writes)
 
@@ -133,6 +138,13 @@ a box stops answering for three polls the gateway rescans and, if the MAC
 answers on another address, reports the move so the room follows it. Logged
 as `agent: discovery scanned N hosts ...`, `agent: learned MAC ...` and
 `agent: controller for zone X moved: A -> B`.
+
+### The Pi itself
+
+Since 2026-09-13 the Pi accepts SSH by key only (`/etc/ssh/sshd_config.d/50-cannabits.conf`)
+and listens on port 22 alone (rpcbind is disabled). To reach it from a new
+machine, add that machine's public key to `~neda/.ssh/authorized_keys` first,
+from a machine that already has access.
 
 ## Verify from a different network (phone hotspot)
 
