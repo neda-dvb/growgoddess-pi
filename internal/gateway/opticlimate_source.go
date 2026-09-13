@@ -49,8 +49,15 @@ func OptiClimateDefaultRegisters() []ModbusRegisterMap {
 	return []ModbusRegisterMap{
 		{Name: "Room1Temp", Metric: "air_temp"},
 		{Name: "Humidity", Metric: "rh"},
-		{Name: "Room1TempWntdDay", Metric: "temp_setpoint"},
-		{Name: "HumiSetPointDay", Metric: "rh_setpoint"},
+		// the ACTIVE setpoints: the day pair while the controller runs its day
+		// program, the night pair at night. During its transitions (Pre-heat,
+		// Cool-down) neither is emitted and the platform's step line carries
+		// the last known value. ContrStatus is requested as the guard only.
+		{Name: "ContrStatus"},
+		{Name: "Room1TempWntdDay", Metric: "temp_setpoint", OnlyWhenRegister: "ContrStatus", OnlyWhenEquals: "Day"},
+		{Name: "Room1TempWntdNight", Metric: "temp_setpoint", OnlyWhenRegister: "ContrStatus", OnlyWhenEquals: "Night"},
+		{Name: "HumiSetPointDay", Metric: "rh_setpoint", OnlyWhenRegister: "ContrStatus", OnlyWhenEquals: "Day"},
+		{Name: "HumiSetPointNight", Metric: "rh_setpoint", OnlyWhenRegister: "ContrStatus", OnlyWhenEquals: "Night"},
 		{Name: "CO2In", Metric: "co2"},
 		{Name: "CO2Enable"}, // guard only, never emitted
 		{Name: "CO2Setpoint", Metric: "co2_setpoint", OnlyWhenTrue: "CO2Enable"},
@@ -101,6 +108,9 @@ func (s *OptiClimateSource) Poll(now time.Time) ([]Reading, error) {
 		}
 		if r.OnlyWhenTrue != "" && !boolValue(values[r.OnlyWhenTrue]) {
 			continue // the function this register belongs to is disabled
+		}
+		if r.OnlyWhenRegister != "" && stringValue(values[r.OnlyWhenRegister]) != r.OnlyWhenEquals {
+			continue // not the program this register applies to
 		}
 		v, ok := values[r.Name]
 		if !ok {

@@ -253,6 +253,13 @@ type ModbusRegisterMap struct {
 	// state means nothing while the controller's CO2 function is disabled.
 	// The guard register is requested but never emitted by itself.
 	OnlyWhenTrue string `json:"onlyWhenTrue,omitempty"`
+	// OnlyWhenRegister / OnlyWhenEquals emit this register only while another
+	// register of the same poll reads exactly the given string: the day
+	// setpoint is the room's setpoint only while the controller runs its day
+	// program, the night setpoint only at night. Two entries may share one
+	// metric; at most one of them emits per poll.
+	OnlyWhenRegister string `json:"onlyWhenRegister,omitempty"`
+	OnlyWhenEquals   string `json:"onlyWhenEquals,omitempty"`
 }
 
 // Physical converts an observed raw value.

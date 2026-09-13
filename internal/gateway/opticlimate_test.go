@@ -215,3 +215,46 @@ func TestOptiClimateLightCell(t *testing.T) {
 		}
 	}
 }
+
+// TestOptiClimateActiveSetpoint: the streamed setpoint is the one the
+// controller is actually holding: the day pair by day, the night pair at
+// night, nothing during a transition (the step line carries the last value).
+func TestOptiClimateActiveSetpoint(t *testing.T) {
+	regs := `"Room1TempWntdDay":{"value":29},"Room1TempWntdNight":{"value":25},"HumiSetPointDay":{"value":64},"HumiSetPointNight":{"value":60}`
+	for _, tc := range []struct {
+		program string
+		temp    float64
+		rh      float64
+		emitted bool
+	}{
+		{"Day", 29, 64, true},
+		{"Night", 25, 60, true},
+		{"Cool-down", 0, 0, false},
+		{"Pre-heat", 0, 0, false},
+	} {
+		payload := `{"getRegisterValues":{"address":0,"values":{"ContrStatus":{"value":"` + tc.program + `"},` + regs + `}}}`
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(payload))
+		}))
+		src := &OptiClimateSource{Zone: "room-1", URL: srv.URL, Every: time.Minute, Client: srv.Client(), Registers: OptiClimateDefaultRegisters()}
+		readings, err := src.Poll(time.Now())
+		srv.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string][]float64{}
+		for _, r := range readings {
+			got[r.Type] = append(got[r.Type], r.Value)
+		}
+		if !tc.emitted {
+			if len(got["temp_setpoint"]) != 0 || len(got["rh_setpoint"]) != 0 {
+				t.Errorf("%s: no setpoint may be emitted during a transition, got %v", tc.program, got)
+			}
+			continue
+		}
+		if len(got["temp_setpoint"]) != 1 || got["temp_setpoint"][0] != tc.temp || len(got["rh_setpoint"]) != 1 || got["rh_setpoint"][0] != tc.rh {
+			t.Errorf("%s: setpoints = %v, want temp %g rh %g exactly once", tc.program, got, tc.temp, tc.rh)
+		}
+	}
+}
