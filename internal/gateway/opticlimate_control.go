@@ -82,7 +82,7 @@ func (c *OptiClimateControl) client() *http.Client {
 	if c.Client != nil {
 		return c.Client
 	}
-	return &http.Client{Timeout: 10 * time.Second}
+	return optiClimateHTTPClient() // fresh connection per call, see the source
 }
 
 // OptiClimateSettings is what the controller holds right now: the four

@@ -107,7 +107,9 @@ func DiscoverOptiClimate(ctx context.Context, hosts []string, port int, dialTime
 	var mu sync.Mutex
 	var found []DiscoveredController
 	var wg sync.WaitGroup
-	client := &http.Client{Timeout: 3 * time.Second}
+	// fresh connection per box: a pooled half-dead connection from an
+	// earlier poll must never make a live box look absent
+	client := &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{DisableKeepAlives: true, DialContext: (&net.Dialer{Timeout: 2 * time.Second}).DialContext}}
 	for _, h := range hosts {
 		if ctx.Err() != nil {
 			break

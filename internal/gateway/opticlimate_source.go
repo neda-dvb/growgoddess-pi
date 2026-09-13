@@ -29,6 +29,7 @@ package gateway
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"time"
@@ -163,7 +164,7 @@ func optiClimateGetValues(client *http.Client, baseURL string, address int, name
 	endpoint := fmt.Sprintf("%s/backend/getRegisterValues?address=%d&ids=%s",
 		baseURL, address, url.QueryEscape(string(idsJSON)))
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
+		client = optiClimateHTTPClient()
 	}
 	resp, err := client.Get(endpoint)
 	if err != nil {
@@ -189,6 +190,24 @@ func optiClimateGetValues(client *http.Client, baseURL string, address int, name
 		out[name] = v.Value
 	}
 	return out, nil
+}
+
+// optiClimateHTTPClient is the client every controller call uses when none is
+// injected. Keep-alives are OFF on purpose: the boxes sit on Wi-Fi and drop
+// idle connections without a reset, and on 2026-09-13 a pooled half-dead
+// connection made every poll time out for eight minutes while a fresh
+// connection answered in a tenth of a second. One connection per call costs
+// nothing at one poll a minute and can never go stale. Dial 3 s, headers 8 s,
+// whole call 10 s.
+func optiClimateHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			DisableKeepAlives:     true,
+			DialContext:           (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
+			ResponseHeaderTimeout: 8 * time.Second,
+		},
+	}
 }
 
 // numericValue reports whether a raw register value is a JSON number and, if
