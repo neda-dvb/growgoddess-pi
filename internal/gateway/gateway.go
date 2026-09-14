@@ -42,6 +42,23 @@ type Reading struct {
 	DeviceID string `json:"deviceId,omitempty"`
 }
 
+// Event is one operational event on its way to the platform: record-only,
+// placed on the chart's time axis (a controller alarm raised or cleared).
+// Kind is one of the platform's chart event kinds.
+type Event struct {
+	Kind       string         `json:"kind"`
+	ZoneID     string         `json:"zoneId"`
+	OccurredAt string         `json:"occurredAt,omitempty"`
+	Payload    map[string]any `json:"payload,omitempty"`
+	SourceRef  string         `json:"sourceRef,omitempty"`
+}
+
+// EventSource is an optional second contract a Source may implement: besides
+// readings it observes discrete events (alarms). Polled on the same cadence.
+type EventSource interface {
+	PollEvents(now time.Time) ([]Event, error)
+}
+
 // Source is the adapter contract. Read-only by design: control interfaces,
 // when they ever exist, will be a separate contract with separate consent.
 type Source interface {
@@ -64,6 +81,7 @@ type Batch struct {
 	DataMode string    `json:"dataMode"`
 	Created  time.Time `json:"created"`
 	Readings []Reading `json:"readings"`
+	Events   []Event   `json:"events,omitempty"`
 }
 
 // BatchID derives the deterministic idempotency key of a flush moment.

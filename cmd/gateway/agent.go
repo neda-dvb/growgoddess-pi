@@ -125,6 +125,7 @@ func runAgent(cfg gateway.Config, key string) {
 	goveeKey := strings.TrimSpace(os.Getenv("GOVEE_API_KEY"))
 
 	readings := make(chan []gateway.Reading, 64)
+	events := make(chan []gateway.Event, 16)
 	health := make(chan sourceHealth, 64)
 	type running struct {
 		ctrl agentController
@@ -192,6 +193,7 @@ func runAgent(cfg gateway.Config, key string) {
 				default:
 				}
 			})
+			go runEventLoop(src, events, stop)
 			log.Printf("agent: streaming %s -> zone %s", src.URL, zone)
 		}
 
@@ -247,14 +249,16 @@ func runAgent(cfg gateway.Config, key string) {
 	cmds := time.NewTicker(5 * time.Second)
 	defer cmds.Stop()
 	var pending []gateway.Reading
+	var pendingEvents []gateway.Event
 
 	flushNow := func() {
-		if len(pending) > 0 {
+		if len(pending) > 0 || len(pendingEvents) > 0 {
 			batch := gateway.Batch{
 				ID: gateway.BatchID(cfg.GatewayLabel, time.Now()), DataMode: "live",
-				Created: time.Now().UTC(), Readings: pending,
+				Created: time.Now().UTC(), Readings: pending, Events: pendingEvents,
 			}
 			pending = nil
+			pendingEvents = nil
 			if dropped, err := spool.Put(batch); err != nil {
 				log.Printf("spool write: %v", err)
 			} else if len(dropped) > 0 {
@@ -266,6 +270,8 @@ func runAgent(cfg gateway.Config, key string) {
 
 	for {
 		select {
+		case evs := <-events:
+			pendingEvents = append(pendingEvents, evs...)
 		case rs := <-readings:
 			pending = append(pending, rs...)
 			// readings from a bound box tell the platform two things once (and
@@ -585,6 +591,43 @@ func pollCommands(api, planID, key string, allowControl bool) {
 			log.Printf("agent: %s %s (%s) failed: %s [%s]", c.Kind, c.ZoneID, c.Controller.Host, errMsg, c.CommandID)
 		}
 		postGatewayResult(api, planID, key, c.CommandID, ok, result, errMsg)
+	}
+}
+
+// runEventLoop polls a source that also observes events (controller alarms)
+// on the source's cadence; sources without events are left alone.
+func runEventLoop(s gateway.Source, out chan<- []gateway.Event, stop <-chan struct{}) {
+	es, ok := s.(gateway.EventSource)
+	if !ok {
+		return
+	}
+	tick := time.NewTicker(s.Interval())
+	defer tick.Stop()
+	poll := func() {
+		evs, err := es.PollEvents(time.Now())
+		if err != nil {
+			log.Printf("%s events: %v", s.Describe(), err)
+			return
+		}
+		if len(evs) == 0 {
+			return
+		}
+		for _, e := range evs {
+			log.Printf("ALARM %s: %v active=%v", e.ZoneID, e.Payload["alarm"], e.Payload["active"])
+		}
+		select {
+		case out <- evs:
+		case <-stop:
+		}
+	}
+	poll()
+	for {
+		select {
+		case <-tick.C:
+			poll()
+		case <-stop:
+			return
+		}
 	}
 }
 

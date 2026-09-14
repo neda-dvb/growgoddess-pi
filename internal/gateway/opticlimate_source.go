@@ -32,6 +32,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"time"
 )
 
@@ -67,6 +68,12 @@ func OptiClimateDefaultRegisters() []ModbusRegisterMap {
 		// level in percent (not PPFD, not lux; the cell's own scale)
 		{Name: "LightCell", Metric: "light_state", Boolean: true},
 		{Name: "LightSensor", Metric: "light_level"},
+		// the equipment: what the unit is doing right now
+		{Name: "PwrRelays", Metric: "cooling_state", Boolean: true},       // compressor on/off
+		{Name: "Compressor", Metric: "cooling_output"},                    // compressor percentage
+		{Name: "Heater", Metric: "heating_state", NonZeroAsState: true},   // heater percentage > 0
+		{Name: "dehumidify", Metric: "dehumidifier_state", Boolean: true}, // de-humidify active
+		{Name: "AirSpeed", Metric: "fan_output"},                          // air speed flow percentage
 	}
 }
 
@@ -79,6 +86,78 @@ type OptiClimateSource struct {
 	// Client is injectable for tests; nil means a fresh client with a ~10s
 	// timeout is used per poll.
 	Client *http.Client
+	// alarms remembers which controller alarms were active at the last event
+	// poll, so only transitions become events. nil until the first poll.
+	alarms map[string]bool
+}
+
+// optiClimateAlarm is one entry of getAlarms.
+type optiClimateAlarm struct {
+	Occurrences    int   `json:"occurrences"`
+	Active         bool  `json:"active"`
+	FirstOccurence int64 `json:"firstOccurrence"`
+	LastOccurrence int64 `json:"lastOccurrence"`
+}
+
+// PollEvents reads the controller's alarm table and turns every change of an
+// alarm's active flag into one chart event (kind "note", payload
+// {event: "controller_alarm", alarm, active, occurrences}). The first poll
+// reports the alarms that are active at that moment, so a restart never
+// hides a standing alarm; a cleared alarm is reported once, when it clears.
+func (s *OptiClimateSource) PollEvents(now time.Time) ([]Event, error) {
+	client := s.Client
+	if client == nil {
+		client = optiClimateHTTPClient()
+	}
+	resp, err := client.Get(fmt.Sprintf("%s/backend/getAlarms?address=%d", s.URL, s.Address))
+	if err != nil {
+		return nil, fmt.Errorf("opticlimate alarms: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("opticlimate alarms: HTTP %d", resp.StatusCode)
+	}
+	var payload struct {
+		GetAlarms struct {
+			Alarms map[string]map[string]optiClimateAlarm `json:"alarms"`
+		} `json:"getAlarms"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("opticlimate alarms decode: %w", err)
+	}
+	current := map[string]bool{}
+	details := map[string]optiClimateAlarm{}
+	for _, byName := range payload.GetAlarms.Alarms { // keyed by unit address
+		for name, a := range byName {
+			current[name] = a.Active
+			details[name] = a
+		}
+	}
+	first := s.alarms == nil
+	var out []Event
+	names := make([]string, 0, len(current))
+	for n := range current {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	ts := now.UTC().Format(time.RFC3339)
+	for _, name := range names {
+		active := current[name]
+		was, known := s.alarms[name]
+		if (first && active) || (!first && (!known || was != active)) {
+			a := details[name]
+			out = append(out, Event{
+				Kind: "note", ZoneID: s.Zone, OccurredAt: ts,
+				Payload: map[string]any{
+					"event": "controller_alarm", "alarm": name, "active": active,
+					"occurrences": a.Occurrences, "lastOccurrence": a.LastOccurrence,
+				},
+				SourceRef: "opticlimate-alarm:" + name,
+			})
+		}
+	}
+	s.alarms = current
+	return out, nil
 }
 
 func (s *OptiClimateSource) Describe() string        { return "opticlimate" }
@@ -128,6 +207,12 @@ func (s *OptiClimateSource) Poll(now time.Time) ([]Reading, error) {
 			}
 		} else if f, ok = numericValue(v); !ok {
 			continue // "Disconnected", null, or any non-number: skip, no error
+		} else if r.NonZeroAsState {
+			if f > 0 {
+				f = 1
+			} else {
+				f = 0
+			}
 		}
 		out = append(out, Reading{
 			SensorID:    s.Zone + ":" + r.Metric,

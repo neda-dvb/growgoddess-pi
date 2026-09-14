@@ -80,9 +80,11 @@ and port) and never touch the Pi again:
 The OptiClimate register map is built into the adapter, so agent mode needs no
 register configuration. Per room it streams, once a minute: air temperature,
 humidity, the setpoint pair the controller is actually holding (day or night,
-by its program), lights on/off and the light cell's level, and CO₂ with its
-setpoint and dosing state once a CO₂ sensor answers and the CO₂ function is
-enabled on the box. Every controller call opens its own connection and closes
+by its program), lights on/off and the light cell's level, the equipment
+(cooling on/off and percentage, heating, de-humidify, fan percentage), and
+CO₂ with its setpoint and dosing state once a CO₂ sensor answers and the CO₂
+function is enabled on the box. The controller's alarms are reported as
+chart events, once when raised and once when cleared. Every controller call opens its own connection and closes
 it; the boxes drop idle Wi-Fi connections silently.
 
 ### Control (setpoint writes)

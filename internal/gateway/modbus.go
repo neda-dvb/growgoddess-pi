@@ -260,6 +260,9 @@ type ModbusRegisterMap struct {
 	// metric; at most one of them emits per poll.
 	OnlyWhenRegister string `json:"onlyWhenRegister,omitempty"`
 	OnlyWhenEquals   string `json:"onlyWhenEquals,omitempty"`
+	// NonZeroAsState emits a numeric register as a state: 1 when it reads
+	// above zero, else 0 (a heater percentage as "heating active").
+	NonZeroAsState bool `json:"nonZeroAsState,omitempty"`
 }
 
 // Physical converts an observed raw value.

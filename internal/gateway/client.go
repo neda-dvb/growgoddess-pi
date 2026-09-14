@@ -46,6 +46,9 @@ func (c *Client) Send(b Batch) (SendResult, error) {
 		"gateway":       map[string]any{"label": c.Label},
 		"readings":      b.Readings,
 	}
+	if len(b.Events) > 0 {
+		envelope["events"] = b.Events
+	}
 	body, err := json.Marshal(envelope)
 	if err != nil {
 		return SendResult{}, err

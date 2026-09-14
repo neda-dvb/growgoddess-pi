@@ -258,3 +258,78 @@ func TestOptiClimateActiveSetpoint(t *testing.T) {
 		}
 	}
 }
+
+// TestOptiClimateEquipment: the compressor relay and percentage, the heater
+// percentage as a state, de-humidify and the air speed map to the
+// platform's equipment metrics.
+func TestOptiClimateEquipment(t *testing.T) {
+	payload := `{"getRegisterValues":{"address":0,"values":{"PwrRelays":{"value":true},"Compressor":{"value":100.0},"Heater":{"value":0.0},"dehumidify":{"value":false},"AirSpeed":{"value":86.0}}}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(payload))
+	}))
+	defer srv.Close()
+	src := &OptiClimateSource{Zone: "room-1", URL: srv.URL, Every: time.Minute, Client: srv.Client(), Registers: OptiClimateDefaultRegisters()}
+	readings, err := src.Poll(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]float64{}
+	for _, r := range readings {
+		got[r.Type] = r.Value
+	}
+	want := map[string]float64{"cooling_state": 1, "cooling_output": 100, "heating_state": 0, "dehumidifier_state": 0, "fan_output": 86}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s = %g, want %g (all: %v)", k, got[k], v, got)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("emitted %v, want exactly %v", got, want)
+	}
+	// a heater at 35 % is heating
+	payload = `{"getRegisterValues":{"address":0,"values":{"Heater":{"value":35.0}}}}`
+	if rs, _ := src.Poll(time.Now()); len(rs) != 1 || rs[0].Type != "heating_state" || rs[0].Value != 1 {
+		t.Errorf("heater 35 %% must be heating_state 1, got %+v", rs)
+	}
+}
+
+// TestOptiClimateAlarmEvents: the first poll reports standing alarms, later
+// polls report only transitions, a cleared alarm once.
+func TestOptiClimateAlarmEvents(t *testing.T) {
+	var body string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+	src := &OptiClimateSource{Zone: "room-1", URL: srv.URL, Every: time.Minute, Client: srv.Client()}
+	now := time.Date(2026, 9, 14, 10, 0, 0, 0, time.UTC)
+
+	body = `{"getAlarms":{"alarms":{"0":{"Room1TempOver":{"occurrences":3,"active":true,"firstOccurrence":1,"lastOccurrence":2},"PowerFailure":{"occurrences":1,"active":false,"firstOccurrence":1,"lastOccurrence":1}}}}}`
+	evs, err := src.PollEvents(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 1 || evs[0].Payload["alarm"] != "Room1TempOver" || evs[0].Payload["active"] != true || evs[0].Kind != "note" || evs[0].ZoneID != "room-1" {
+		t.Fatalf("first poll must report only the standing alarm, got %+v", evs)
+	}
+	// nothing changed: no events
+	if evs, _ := src.PollEvents(now.Add(time.Minute)); len(evs) != 0 {
+		t.Fatalf("unchanged alarms must not repeat, got %+v", evs)
+	}
+	// the alarm clears, another one raises
+	body = `{"getAlarms":{"alarms":{"0":{"Room1TempOver":{"occurrences":3,"active":false,"firstOccurrence":1,"lastOccurrence":2},"PowerFailure":{"occurrences":2,"active":true,"firstOccurrence":1,"lastOccurrence":3}}}}}`
+	evs, _ = src.PollEvents(now.Add(2 * time.Minute))
+	if len(evs) != 2 {
+		t.Fatalf("one cleared and one raised alarm must give two events, got %+v", evs)
+	}
+	if evs[0].Payload["alarm"] != "PowerFailure" || evs[0].Payload["active"] != true || evs[1].Payload["alarm"] != "Room1TempOver" || evs[1].Payload["active"] != false {
+		t.Fatalf("events = %+v", evs)
+	}
+	// an empty table after a standing alarm: nothing to report (the alarm simply vanished from the table)
+	body = `{"getAlarms":{"alarms":{}}}`
+	if evs, _ := src.PollEvents(now.Add(3 * time.Minute)); len(evs) != 0 {
+		t.Fatalf("an alarm dropped from the table is not a transition, got %+v", evs)
+	}
+}
