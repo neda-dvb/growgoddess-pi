@@ -613,6 +613,10 @@ func runEventLoop(s gateway.Source, out chan<- []gateway.Event, stop <-chan stru
 			return
 		}
 		for _, e := range evs {
+			if e.Payload["event"] == "controller_link" {
+				log.Printf("LINK %s: %v ok=%v", e.ZoneID, e.Payload["status"], e.Payload["ok"])
+				continue
+			}
 			log.Printf("ALARM %s: %v active=%v", e.ZoneID, e.Payload["alarm"], e.Payload["active"])
 		}
 		select {

@@ -29,6 +29,7 @@ package gateway
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -77,6 +78,20 @@ func OptiClimateDefaultRegisters() []ModbusRegisterMap {
 	}
 }
 
+// optiClimateLinkRegister is the network box's own report of its connection
+// to the air unit: "Ok", or one of "Lost", "LostNotify", "Missing",
+// "MissingNotify". The box that answers on the LAN is a display computer; the
+// air unit hangs behind it on a cable. When that link is down the box keeps
+// answering, with defaults: Room1Temp 0.0, Humidity 50.0, every other
+// temperature 20.0, all versions 0 (Cannaru Room 8, 2026-09-21). Those are
+// not measurements, and Humidity 50.0 even sits inside the valid range, so
+// while the link is not "Ok" the source emits nothing at all.
+const optiClimateLinkRegister = "AircoConnectionStatus"
+
+// optiClimateLinkReminder is how often a STANDING loss is reported again, so
+// a chart window opened days later still holds the reason the room is empty.
+const optiClimateLinkReminder = 6 * time.Hour
+
 type OptiClimateSource struct {
 	Zone      string
 	URL       string              // controller base URL, e.g. http://192.168.2.110:4001
@@ -89,6 +104,27 @@ type OptiClimateSource struct {
 	// alarms remembers which controller alarms were active at the last event
 	// poll, so only transitions become events. nil until the first poll.
 	alarms map[string]bool
+	// link is the last link status the EVENT poll saw ("" = none yet), and
+	// linkReported when a loss was last reported. Touched only by PollEvents.
+	link         string
+	linkReported time.Time
+	// linkLogged is the last link status the READ poll logged, so the journal
+	// gets one line per change, not one per minute. Touched only by Poll.
+	linkLogged string
+}
+
+// optiClimateLink asks the box for its link to the air unit. known is false
+// when the box does not answer, returns no string, or does not have the
+// register: a box answers a requestError for the WHOLE call when one name is
+// unknown, which is why this is its own small call and never rides on the
+// readings request. Unknown never blocks a room's readings.
+func optiClimateLink(client *http.Client, baseURL string, address int) (status string, known bool) {
+	values, err := optiClimateGetValues(client, baseURL, address, []string{optiClimateLinkRegister})
+	if err != nil {
+		return "", false
+	}
+	status = stringValue(values[optiClimateLinkRegister])
+	return status, status != ""
 }
 
 // optiClimateAlarm is one entry of getAlarms.
@@ -157,7 +193,36 @@ func (s *OptiClimateSource) PollEvents(now time.Time) ([]Event, error) {
 		}
 	}
 	s.alarms = current
+	if e, ok := s.linkEvent(client, now); ok {
+		out = append(out, e)
+	}
 	return out, nil
+}
+
+// linkEvent turns the box's link to its air unit into chart events (kind
+// "sensor_status", payload {event: "controller_link", status, ok}): a loss
+// when it happens or is found standing on the first poll, again every
+// optiClimateLinkReminder while it stands, and the recovery once. A link that
+// is healthy from the start is silent, and so is an unknown status.
+func (s *OptiClimateSource) linkEvent(client *http.Client, now time.Time) (Event, bool) {
+	status, known := optiClimateLink(client, s.URL, s.Address)
+	if !known {
+		return Event{}, false
+	}
+	ok, wasOK := status == "Ok", s.link == "" || s.link == "Ok"
+	s.link = status
+	switch {
+	case !ok && (wasOK || now.Sub(s.linkReported) >= optiClimateLinkReminder):
+		s.linkReported = now
+	case ok && !wasOK:
+	default:
+		return Event{}, false
+	}
+	return Event{
+		Kind: "sensor_status", ZoneID: s.Zone, OccurredAt: now.UTC().Format(time.RFC3339),
+		Payload:   map[string]any{"event": "controller_link", "status": status, "ok": ok},
+		SourceRef: "opticlimate-link",
+	}, true
 }
 
 func (s *OptiClimateSource) Describe() string        { return "opticlimate" }
@@ -169,6 +234,22 @@ func (s *OptiClimateSource) Interval() time.Duration { return s.Every }
 // or HTTP failures return an error (so the caller logs and skips this tick);
 // individual non-numeric values never produce an error.
 func (s *OptiClimateSource) Poll(now time.Time) ([]Reading, error) {
+	// the box's link to its air unit first: without it every value below is
+	// a default, so nothing is asked for and nothing is emitted. Not an error:
+	// the box answers, so the agent must not start looking for it by MAC.
+	if status, known := optiClimateLink(s.Client, s.URL, s.Address); known {
+		if status != s.linkLogged {
+			if status != "Ok" {
+				log.Printf("opticlimate %s: the box reports %s %q: no link to the air unit, its values are defaults, nothing is recorded", s.Zone, optiClimateLinkRegister, status)
+			} else if s.linkLogged != "" {
+				log.Printf("opticlimate %s: link to the air unit is back, streaming again", s.Zone)
+			}
+			s.linkLogged = status
+		}
+		if status != "Ok" {
+			return nil, nil
+		}
+	}
 	names := make([]string, 0, len(s.Registers))
 	for _, r := range s.Registers {
 		if r.Name != "" {

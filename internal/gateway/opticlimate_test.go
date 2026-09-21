@@ -333,3 +333,111 @@ func TestOptiClimateAlarmEvents(t *testing.T) {
 		t.Fatalf("an alarm dropped from the table is not a transition, got %+v", evs)
 	}
 }
+
+// linkTestServer answers like one network box: the link-status request (ids
+// holds only AircoConnectionStatus) gets linkBody, every other request gets
+// valuesBody. It counts the value requests so a test can prove none was made.
+func linkTestServer(t *testing.T, linkBody, valuesBody *string, valueCalls *int) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/backend/getAlarms":
+			_, _ = w.Write([]byte(`{"getAlarms":{"alarms":{}}}`))
+		case r.URL.Query().Get("ids") == `["AircoConnectionStatus"]`:
+			_, _ = w.Write([]byte(*linkBody))
+		default:
+			*valueCalls++
+			_, _ = w.Write([]byte(*valuesBody))
+		}
+	}))
+}
+
+// A network box that has lost its link to the air unit still answers, with
+// defaults: Room1Temp 0.0, Humidity 50.0, every other temperature 20.0 (Cannaru
+// Room 8, 2026-09-21; Humidity 50.0 sat inside the valid range and was stored
+// as measured). None of it is a measurement, so nothing may be emitted.
+func TestOptiClimateLinkLostEmitsNothing(t *testing.T) {
+	link := `{"getRegisterValues":{"address":0,"values":{"AircoConnectionStatus":{"value":"LostNotify"}}}}`
+	values := `{"getRegisterValues":{"address":0,"values":{"Room1Temp":{"value":0.0},"Humidity":{"value":50.0},"LightSensor":{"value":49.89},"LightCell":{"value":true}}}}`
+	calls := 0
+	srv := linkTestServer(t, &link, &values, &calls)
+	defer srv.Close()
+	src := &OptiClimateSource{Zone: "room-7", URL: srv.URL, Registers: OptiClimateDefaultRegisters(), Every: time.Minute, Client: srv.Client()}
+	now := time.Date(2026, 9, 21, 8, 14, 0, 0, time.UTC)
+
+	rs, err := src.Poll(now)
+	if err != nil {
+		t.Fatalf("a box that answers is not a failed poll (the MAC re-find must not start): %v", err)
+	}
+	if len(rs) != 0 {
+		t.Fatalf("a box without a link to its unit must emit nothing, got %+v", rs)
+	}
+	if calls != 0 {
+		t.Fatalf("the values must not even be requested while the link is lost, got %d calls", calls)
+	}
+
+	// the link comes back: the same box streams again
+	link = `{"getRegisterValues":{"address":0,"values":{"AircoConnectionStatus":{"value":"Ok"}}}}`
+	values = `{"getRegisterValues":{"address":0,"values":{"Room1Temp":{"value":24.3},"Humidity":{"value":61.5}}}}`
+	rs, err = src.Poll(now.Add(time.Minute))
+	if err != nil || len(rs) != 2 {
+		t.Fatalf("a restored link must stream again, got %+v err %v", rs, err)
+	}
+}
+
+// Older firmware may not know the register: the box then answers a
+// requestError for the whole call. That must never cost a room its readings.
+func TestOptiClimateLinkUnknownStreamsAsBefore(t *testing.T) {
+	link := `{"getRegisterValues":{"requestError":["GUI API parameter ids contains an identifier which is not a register: AircoConnectionStatus"]}}`
+	values := `{"getRegisterValues":{"address":0,"values":{"Room1Temp":{"value":24.3},"Humidity":{"value":61.5}}}}`
+	calls := 0
+	srv := linkTestServer(t, &link, &values, &calls)
+	defer srv.Close()
+	src := &OptiClimateSource{Zone: "room-1", URL: srv.URL, Registers: OptiClimateDefaultRegisters(), Every: time.Minute, Client: srv.Client()}
+	rs, err := src.Poll(time.Date(2026, 9, 21, 8, 0, 0, 0, time.UTC))
+	if err != nil || len(rs) != 2 {
+		t.Fatalf("an unknown link status must not block the readings, got %+v err %v", rs, err)
+	}
+}
+
+func TestOptiClimateLinkEvents(t *testing.T) {
+	link := `{"getRegisterValues":{"address":0,"values":{"AircoConnectionStatus":{"value":"LostNotify"}}}}`
+	values := `{}`
+	calls := 0
+	srv := linkTestServer(t, &link, &values, &calls)
+	defer srv.Close()
+	src := &OptiClimateSource{Zone: "room-7", URL: srv.URL, Every: time.Minute, Client: srv.Client()}
+	now := time.Date(2026, 9, 21, 8, 14, 0, 0, time.UTC)
+
+	evs, err := src.PollEvents(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 1 || evs[0].Kind != "sensor_status" || evs[0].ZoneID != "room-7" ||
+		evs[0].Payload["event"] != "controller_link" || evs[0].Payload["status"] != "LostNotify" || evs[0].Payload["ok"] != false {
+		t.Fatalf("a standing loss must be reported on the first poll, got %+v", evs)
+	}
+	if evs, _ := src.PollEvents(now.Add(time.Minute)); len(evs) != 0 {
+		t.Fatalf("an unchanged loss must not repeat every minute, got %+v", evs)
+	}
+	// a standing loss is said again after the reminder interval, so a chart
+	// window opened days later still holds the reason the room is empty
+	if evs, _ := src.PollEvents(now.Add(optiClimateLinkReminder + time.Minute)); len(evs) != 1 || evs[0].Payload["ok"] != false {
+		t.Fatalf("a standing loss must be reported again after the reminder interval, got %+v", evs)
+	}
+	link = `{"getRegisterValues":{"address":0,"values":{"AircoConnectionStatus":{"value":"Ok"}}}}`
+	evs, _ = src.PollEvents(now.Add(optiClimateLinkReminder + 2*time.Minute))
+	if len(evs) != 1 || evs[0].Payload["ok"] != true || evs[0].Payload["status"] != "Ok" {
+		t.Fatalf("a restored link must be reported once, got %+v", evs)
+	}
+	if evs, _ := src.PollEvents(now.Add(optiClimateLinkReminder + 3*time.Minute)); len(evs) != 0 {
+		t.Fatalf("a healthy link is silent, got %+v", evs)
+	}
+
+	// a box that is healthy from the first poll never produces a link event
+	healthy := &OptiClimateSource{Zone: "room-3", URL: srv.URL, Every: time.Minute, Client: srv.Client()}
+	if evs, _ := healthy.PollEvents(now); len(evs) != 0 {
+		t.Fatalf("a healthy first poll must be silent, got %+v", evs)
+	}
+}
