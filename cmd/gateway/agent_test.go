@@ -19,7 +19,7 @@ func testGates(allowControl bool) commandGates {
 // performed, whatever its kind.
 func TestPerformCommandGates(t *testing.T) {
 	now := time.Date(2026, 9, 10, 16, 0, 0, 0, time.UTC)
-	ctrl := agentController{Vendor: "opticlimate", Host: "192.0.2.1", Port: 4001}
+	ctrl := agentController{Vendor: "opticlimate", Host: "controller.invalid", Port: 4001}
 
 	ok, _, msg := performCommand(agentCommand{Kind: "set_setpoint", Controller: ctrl,
 		Payload:   map[string]any{"setpoint": "temp_day", "value": 28.0},
@@ -113,8 +113,15 @@ func TestCommandHostValidation(t *testing.T) {
 	g := commandGates{AllowControl: false, Discovered: found,
 		HostAllowed: func(h string) bool { return gateway.HostInNetworks(h, nets) || found.has(h) }}
 	refused := "the controller address is outside this gateway's controller networks"
+	// set_setpoint with control off never opens a connection, whatever the
+	// gate does; the kinds that read are tried only on a name that never
+	// resolves, so even a broken gate reaches nothing
 	for _, host := range []string{"198.51.100.7", "127.0.0.1", "192.168.3.7", "evil.invalid", "169.254.169.254"} {
-		for _, kind := range []string{"test", "read_settings", "set_setpoint"} {
+		kinds := []string{"set_setpoint"}
+		if host == "evil.invalid" {
+			kinds = append(kinds, "test", "read_settings")
+		}
+		for _, kind := range kinds {
 			ok, _, msg := performCommand(agentCommand{Kind: kind, Controller: agentController{Vendor: "opticlimate", Host: host},
 				Payload: map[string]any{"setpoint": "temp_day", "value": 25.0}}, g, now)
 			if ok || msg != refused {
@@ -146,19 +153,19 @@ func TestCommandHostValidation(t *testing.T) {
 func TestGuardBandRefusalOnTheGateway(t *testing.T) {
 	now := time.Date(2026, 10, 14, 10, 0, 0, 0, time.UTC)
 	g := testGates(true)
-	// 192.0.2.1 (TEST-NET) answers nothing: a refusal here can only come from the band
+	// controller.invalid never resolves: a refusal here can only come from the band
 	for _, c := range []struct {
 		key   string
 		value float64
 	}{{"temp_day", 35}, {"temp_night", 10}, {"rh_day", 95}, {"rh_night", 20}} {
-		ok, _, msg := performCommand(agentCommand{Kind: "set_setpoint", Controller: agentController{Vendor: "opticlimate", Host: "192.0.2.1"},
+		ok, _, msg := performCommand(agentCommand{Kind: "set_setpoint", Controller: agentController{Vendor: "opticlimate", Host: "controller.invalid"},
 			Payload: map[string]any{"setpoint": c.key, "value": c.value}}, g, now)
 		if ok || !strings.Contains(msg, "outside the gateway's guard band") {
 			t.Errorf("%s=%g: ok=%v %q, want a guard band refusal", c.key, c.value, ok, msg)
 		}
 	}
 	g.Band = gateway.GuardBand{TempMin: 20, TempMax: 26}
-	if _, _, msg := performCommand(agentCommand{Kind: "set_setpoint", Controller: agentController{Vendor: "opticlimate", Host: "192.0.2.1"},
+	if _, _, msg := performCommand(agentCommand{Kind: "set_setpoint", Controller: agentController{Vendor: "opticlimate", Host: "controller.invalid"},
 		Payload: map[string]any{"setpoint": "temp_day", "value": 27.0}}, g, now); !strings.Contains(msg, "guard band") {
 		t.Errorf("a configured band applies, got %q", msg)
 	}

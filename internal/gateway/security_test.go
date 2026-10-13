@@ -14,17 +14,17 @@ func TestValidateAPIURLRefusesPlainHTTP(t *testing.T) {
 		insecure bool
 		ok       bool
 	}{
-		{"https://growgoddess.club", false, true},
-		{"https://growgoddess.club/", false, true},
-		{"http://growgoddess.club", false, false},
-		{"http://growgoddess.club", true, false}, // the flag is for localhost only
+		{"https://api.gateway-test.invalid", false, true},
+		{"https://api.gateway-test.invalid/", false, true},
+		{"http://api.gateway-test.invalid", false, false},
+		{"http://api.gateway-test.invalid", true, false}, // the flag is for localhost only
 		{"http://192.168.2.10:8080", true, false},
 		{"http://localhost:8080", false, false},
 		{"http://localhost:8080", true, true},
 		{"http://127.0.0.1:8080", true, true},
 		{"http://[::1]:8080", true, true},
-		{"ftp://growgoddess.club", true, false},
-		{"growgoddess.club", false, false},
+		{"ftp://api.gateway-test.invalid", true, false},
+		{"api.gateway-test.invalid", false, false},
 		{"", false, false},
 	}
 	for _, c := range cases {
@@ -95,8 +95,8 @@ func TestControllerNetworks(t *testing.T) {
 	for host, want := range map[string]bool{
 		"192.168.2.110": true, "10.1.2.3": true, "172.16.5.4": true, "169.254.1.1": true,
 		"fe80::1": true, "fd00::5": true, "::ffff:192.168.2.110": true,
-		"172.32.0.1": false, "8.8.8.8": false, "127.0.0.1": false, "::1": false, "0.0.0.0": false,
-		"opticlimate.local": false, "evil.example.com": false, "": false,
+		"172.32.0.1": false, "198.51.100.8": false, "127.0.0.1": false, "::1": false, "0.0.0.0": false,
+		"opticlimate.local": false, "evil.invalid": false, "": false,
 	} {
 		if got := HostInNetworks(host, def); got != want {
 			t.Errorf("default networks: %q allowed=%v, want %v", host, got, want)
@@ -109,7 +109,7 @@ func TestControllerNetworks(t *testing.T) {
 	if HostInNetworks("192.168.3.4", narrow) || !HostInNetworks("192.168.2.200", narrow) {
 		t.Error("a narrowed list allows exactly its network")
 	}
-	for _, bad := range [][]string{{"0.0.0.0/0"}, {"8.8.8.0/24"}, {"10.0.0.0/7"}, {"192.168.0.0/15"}, {"fc00::/6"}, {"127.0.0.0/8"}, {"not-a-cidr"}} {
+	for _, bad := range [][]string{{"0.0.0.0/0"}, {"198.51.100.0/24"}, {"10.0.0.0/7"}, {"192.168.0.0/15"}, {"fc00::/6"}, {"127.0.0.0/8"}, {"not-a-cidr"}} {
 		if _, err := ParseControllerNetworks(bad); err == nil {
 			t.Errorf("controllerNetworks %v must be refused", bad)
 		}
@@ -129,11 +129,11 @@ func TestStricterPolicy(t *testing.T) {
 }
 
 func TestEdgeProblems(t *testing.T) {
-	ok := Config{API: "https://growgoddess.club"}
+	ok := Config{API: "https://api.gateway-test.invalid"}
 	if p := ok.EdgeProblems(false); len(p) != 0 {
 		t.Fatalf("a plain https config has no problems: %v", p)
 	}
-	bad := Config{API: "http://growgoddess.club", SyncPolicy: "everything", ControllerNetworks: []string{"0.0.0.0/0"}, GuardBand: GuardBand{TempMin: 40}}
+	bad := Config{API: "http://api.gateway-test.invalid", SyncPolicy: "everything", ControllerNetworks: []string{"0.0.0.0/0"}, GuardBand: GuardBand{TempMin: 40}}
 	if p := bad.EdgeProblems(true); len(p) != 4 {
 		t.Fatalf("want 4 problems (http, band, networks, policy), got %d: %v", len(p), p)
 	}
