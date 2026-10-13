@@ -83,6 +83,8 @@ type agentConfigResp struct {
 	// set when this gateway authenticated with its own key
 	GatewayID  string `json:"gatewayId"`
 	SyncPolicy string `json:"syncPolicy"`
+	// the owner asked this gateway to rotate its key
+	Rotate bool `json:"rotate"`
 }
 
 // hostSet is the controllers this gateway's own LAN scans found; safe for
@@ -122,6 +124,14 @@ func (g commandGates) hostAllowed(host string) bool {
 	return g.HostAllowed != nil && g.HostAllowed(host)
 }
 
+// authStatus turns a refused key (401, 403) into gateway.ErrUnauthorized.
+func authStatus(code int) error {
+	if code == http.StatusUnauthorized || code == http.StatusForbidden {
+		return fmt.Errorf("%w: HTTP %d", gateway.ErrUnauthorized, code)
+	}
+	return nil
+}
+
 func fetchGatewayConfig(api, planID, key string) (agentConfigResp, error) {
 	url := fmt.Sprintf("%s/api/pro/plans/%s/gateway/config", strings.TrimRight(api, "/"), planID)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
@@ -134,6 +144,9 @@ func fetchGatewayConfig(api, planID, key string) (agentConfigResp, error) {
 		return agentConfigResp{}, err
 	}
 	defer resp.Body.Close()
+	if err := authStatus(resp.StatusCode); err != nil {
+		return agentConfigResp{}, err
+	}
 	if resp.StatusCode != http.StatusOK {
 		return agentConfigResp{}, fmt.Errorf("config HTTP %d", resp.StatusCode)
 	}
@@ -163,6 +176,8 @@ func runAgent(cfg gateway.Config, key string) {
 		HostAllowed: func(host string) bool { return gateway.HostInNetworks(host, nets) || discovered.has(host) },
 	}
 	syncFilter := &gateway.SyncFilter{Policy: gateway.StricterPolicy(cfg.SyncPolicy, ""), Local: cfg.LocalStore()}
+	auth := &gateway.AuthState{Logf: log.Printf}
+	var lastRotateTry time.Time
 	refusedHost := map[string]string{} // zone -> refused host, so the log says it once
 
 	flushEvery := time.Duration(cfg.FlushSeconds) * time.Second
@@ -206,9 +221,24 @@ func runAgent(cfg gateway.Config, key string) {
 
 	reconcile := func() {
 		conf, err := fetchGatewayConfig(cfg.API, cfg.PlanID, key)
+		auth.Observe(err, time.Now())
 		if err != nil {
-			log.Printf("agent config poll: %v", err)
+			if !auth.Unauthorised() {
+				log.Printf("agent config poll: %v", err)
+			}
 			return
+		}
+		// the owner asked for a new key: rotate it here, with overlap (at
+		// most one attempt an hour if storing the key fails)
+		if conf.Rotate && conf.GatewayID != "" && time.Since(lastRotateTry) > time.Hour {
+			lastRotateTry = time.Now()
+			if next, err := rotateKey(cfg.API, cfg.PlanID, key, cfg.StateKeyPath()); err != nil {
+				log.Printf("agent: KEY ROTATION FAILED: %v", err)
+			} else {
+				key, client.Key = next, next
+				lastRotateTry = time.Time{}
+				log.Printf("agent: rotated to a new key %s... (stored in %s)", next[:12], cfg.StateKeyPath())
+			}
 		}
 		if p := gateway.StricterPolicy(cfg.SyncPolicy, conf.SyncPolicy); p != syncFilter.Policy {
 			log.Printf("agent: sync policy %s (gateway.json %q, platform %q)", p, cfg.SyncPolicy, conf.SyncPolicy)
@@ -335,13 +365,9 @@ func runAgent(cfg gateway.Config, key string) {
 				Created: time.Now().UTC(), Readings: send, Events: pendingEvents,
 			}
 			pendingEvents = nil
-			if dropped, err := spool.Put(batch); err != nil {
-				log.Printf("spool write: %v", err)
-			} else if len(dropped) > 0 {
-				log.Printf("SPOOL FULL: dropped %d oldest batch(es): %v", len(dropped), dropped)
-			}
+			spoolPut(spool, auth, batch)
 		}
-		drain(spool, client)
+		drain(spool, client, auth)
 	}
 
 	for {
@@ -386,7 +412,7 @@ func runAgent(cfg gateway.Config, key string) {
 		case <-poll.C:
 			reconcile()
 		case <-cmds.C:
-			pollCommands(cfg.API, cfg.PlanID, key, gates)
+			pollCommands(cfg.API, cfg.PlanID, key, gates, auth)
 		case <-flush.C:
 			flushNow()
 		case <-sig:
@@ -426,6 +452,9 @@ func fetchGatewayCommands(api, planID, key string) ([]agentCommand, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if err := authStatus(resp.StatusCode); err != nil {
+		return nil, err
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("commands HTTP %d", resp.StatusCode)
 	}
@@ -653,9 +682,13 @@ func performCommand(c agentCommand, g commandGates, now time.Time) (bool, map[st
 
 var lastCommandsPollError time.Time
 
-func pollCommands(api, planID, key string, gates commandGates) {
+func pollCommands(api, planID, key string, gates commandGates, auth *gateway.AuthState) {
 	cmds, err := fetchGatewayCommands(api, planID, key)
+	auth.Observe(err, time.Now())
 	if err != nil {
+		if auth.Unauthorised() {
+			return // the state logs itself once an hour
+		}
 		// the poll runs every 5s; log a failing backend once a minute, not 12 times
 		if time.Since(lastCommandsPollError) > time.Minute {
 			log.Printf("agent: commands poll: %v", err)
@@ -680,6 +713,47 @@ func pollCommands(api, planID, key string, gates commandGates) {
 		}
 		postGatewayResult(api, planID, key, c.CommandID, ok, result, errMsg)
 	}
+}
+
+// rotateKey asks the platform for a new key with the current one, stores it
+// durably, then confirms it with the new key; from the confirmation on only
+// the new key works. Until then both do (at most 24 hours), so a failure at
+// any step never locks the gateway out: if the new key cannot be stored the
+// gateway keeps the current one and does not confirm. Returns the new key.
+func rotateKey(api, planID, current, keyPath string) (string, error) {
+	base := fmt.Sprintf("%s/api/pro/plans/%s/gateway/rotate", strings.TrimRight(api, "/"), planID)
+	call := func(url, key string) (*http.Response, error) {
+		req, err := http.NewRequest(http.MethodPost, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("X-Api-Key", key)
+		return (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	}
+	resp, err := call(base, current)
+	if err != nil {
+		return "", err
+	}
+	var out struct {
+		Key string `json:"key"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&out)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated || err != nil || !strings.HasPrefix(out.Key, "cbk_") {
+		return "", fmt.Errorf("rotate: HTTP %d", resp.StatusCode)
+	}
+	if err := gateway.WriteKeyFile(keyPath, out.Key); err != nil {
+		return "", fmt.Errorf("the new key could not be stored in %s, keeping the current one (it works for 24 hours, then this gateway is unauthorised): %w", keyPath, err)
+	}
+	resp, err = call(base+"/confirm", out.Key)
+	if err != nil {
+		return out.Key, nil // the new key is stored and works; the platform switches over after 24 hours
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("agent: rotation confirm: HTTP %d (the new key works; the platform switches over after 24 hours)", resp.StatusCode)
+	}
+	return out.Key, nil
 }
 
 // runEventLoop polls a source that also observes events (controller alarms)

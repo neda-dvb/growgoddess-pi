@@ -18,6 +18,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -107,6 +108,34 @@ type Spool struct {
 	// batch per minute). Beyond it the OLDEST batches are dropped with an
 	// error returned, so data loss is loud, never silent.
 	MaxBatches int
+	// HoldMax bounds the spool while it is held (default 10 x MaxBatches,
+	// about 40 days at one batch a minute).
+	HoldMax int
+	// hold: the platform refuses this gateway's key. Nothing is dropped; at
+	// HoldMax new batches are refused instead (ErrSpoolHeld), so what is
+	// stored is kept. backlog: a hold ended but the spool is still above
+	// MaxBatches; nothing is dropped until it drains below.
+	hold, backlog bool
+}
+
+// ErrSpoolHeld: the spool is held (the key is refused) and full; the batch
+// was not written, the stored ones are kept.
+var ErrSpoolHeld = errors.New("spool held and full: new data is not recorded, stored batches are kept")
+
+// SetHold holds the spool while the platform refuses the gateway's key: no
+// batch is ever dropped because of an auth problem.
+func (s *Spool) SetHold(on bool) {
+	s.hold = on
+	if on {
+		s.backlog = true
+	}
+}
+
+func (s *Spool) holdMax() int {
+	if s.HoldMax > 0 {
+		return s.HoldMax
+	}
+	return 10 * s.MaxBatches
 }
 
 func NewSpool(dir string, maxBatches int) (*Spool, error) {
@@ -126,6 +155,19 @@ func (s *Spool) path(id string) string {
 // Put persists a batch before any send attempt. Returns the ids of batches
 // dropped to respect the bound (normally none).
 func (s *Spool) Put(b Batch) ([]string, error) {
+	keepAll := s.hold || s.backlog
+	if keepAll {
+		ids, err := s.Pending()
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case !s.hold && len(ids) < s.MaxBatches:
+			s.backlog, keepAll = false, false // drained back under the normal bound
+		case len(ids) >= s.holdMax():
+			return nil, ErrSpoolHeld
+		}
+	}
 	buf, err := json.Marshal(b)
 	if err != nil {
 		return nil, err
@@ -136,6 +178,9 @@ func (s *Spool) Put(b Batch) ([]string, error) {
 	}
 	if err := os.Rename(tmp, s.path(b.ID)); err != nil {
 		return nil, err
+	}
+	if keepAll {
+		return nil, nil
 	}
 	ids, err := s.Pending()
 	if err != nil {
@@ -258,6 +303,13 @@ func (c Config) EdgeProblems(allowInsecureLocalhost bool) []string {
 		problems = append(problems, fmt.Sprintf("syncPolicy %q: use full, aggregated or local_only", c.SyncPolicy))
 	}
 	return problems
+}
+
+// StateKeyPath is where the gateway keeps its own key (written by enroll
+// and by rotation): next to the spool, in the one directory the service may
+// write. A key there wins over CANNABITS_API_KEY, keyFile and key.
+func (c Config) StateKeyPath() string {
+	return filepath.Join(filepath.Dir(filepath.Clean(c.SpoolDir)), "gateway.key")
 }
 
 // LocalStore is where readings stay under aggregated and local_only.

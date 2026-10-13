@@ -3,12 +3,13 @@
 //
 //	sudo cannabits-gateway enroll 7KQ2-M9XD-4TRB
 //
-// The key goes into the env file (CANNABITS_API_KEY=..., replacing any
-// earlier key, mode 0600); the plan id into gateway.json. Both files keep
-// their owner. The API URL comes from CANNABITS_API_URL in the environment,
-// then in the env file, then "api" in gateway.json, and must be https.
-// Re-running enroll with a new code (after "rotate" in the app) replaces the
-// key; the old one stops working at that moment.
+// The key goes into gateway.key next to the spool (/var/lib/cannabits-gateway,
+// mode 0600, owned like that directory, so the service can rotate it later);
+// it wins over CANNABITS_API_KEY. The plan id goes into gateway.json, which
+// keeps its owner. The API URL comes from CANNABITS_API_URL in the
+// environment, then in the env file, then "api" in gateway.json, and must be
+// https. Re-running enroll with a new code (a replaced Pi) replaces the key;
+// the old one stops working at that moment.
 package main
 
 import (
@@ -39,7 +40,7 @@ func runEnroll(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("enroll", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	configPath := fs.String("config", "/etc/cannabits/gateway.json", "gateway configuration file (receives planId)")
-	envPath := fs.String("env-file", "/etc/cannabits/gateway.env", "environment file (receives CANNABITS_API_KEY)")
+	envPath := fs.String("env-file", "/etc/cannabits/gateway.env", "environment file (read for CANNABITS_API_URL)")
 	insecureLocalhost := fs.Bool("insecure-localhost", false, "allow a plain http API URL on localhost (development only)")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -71,15 +72,26 @@ func runEnroll(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "enroll: %v\n", err)
 		return 1
 	}
+	spoolDir, _ := conf["spoolDir"].(string)
+	if spoolDir == "" {
+		fmt.Fprintln(stderr, "enroll: gateway.json has no spoolDir; the key is kept next to the spool")
+		return 1
+	}
+	keyPath := gateway.Config{SpoolDir: spoolDir}.StateKeyPath()
+	stateDir := filepath.Dir(keyPath)
+	if fi, err := os.Stat(stateDir); err != nil || !fi.IsDir() {
+		fmt.Fprintf(stderr, "enroll: %s does not exist; run install.sh first\n", stateDir)
+		return 1
+	}
 
 	res, err := redeemEnrollment(api, code)
 	if err != nil {
 		fmt.Fprintf(stderr, "enroll: %v\n", err)
 		return 1
 	}
-	if err := setEnvFileValue(*envPath, "CANNABITS_API_KEY", res.Key); err != nil {
+	if err := storeKey(keyPath, stateDir, res.Key); err != nil {
 		// the code is spent: say plainly what to do, never print the key
-		fmt.Fprintf(stderr, "enroll: the platform issued a key but it could not be stored: %v\nCreate a new code in Grow Goddess Pro (Rotate) and run enroll again.\n", err)
+		fmt.Fprintf(stderr, "enroll: the platform issued a key but it could not be stored: %v\nCreate a new enrollment code in Grow Goddess Pro and run enroll again.\n", err)
 		return 1
 	}
 	conf["planId"] = res.PlanID
@@ -89,7 +101,7 @@ func runEnroll(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stdout, "enrolled: gateway %s for plan %s, key %s... stored in %s, sync policy %s\nnext: sudo systemctl restart cannabits-gateway\n",
-		res.GatewayID, res.PlanID, res.KeyPrefix, *envPath, res.SyncPolicy)
+		res.GatewayID, res.PlanID, res.KeyPrefix, keyPath, res.SyncPolicy)
 	return 0
 }
 
@@ -136,26 +148,13 @@ func envFileValue(path, name string) string {
 	return ""
 }
 
-// setEnvFileValue replaces (or appends) NAME=value in an environment file,
-// keeping every other line, mode 0600.
-func setEnvFileValue(path, name, value string) error {
-	var lines []string
-	if raw, err := os.ReadFile(path); err == nil {
-		lines = strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
-	} else if !os.IsNotExist(err) {
+// storeKey writes the key file (0600, temp then rename) and gives it the
+// owner of the state directory, so the service user can read and rotate it.
+func storeKey(keyPath, stateDir, key string) error {
+	if err := gateway.WriteKeyFile(keyPath, key); err != nil {
 		return err
 	}
-	done := false
-	for i, line := range lines {
-		if strings.HasPrefix(strings.TrimSpace(line), name+"=") {
-			lines[i] = name + "=" + value
-			done = true
-		}
-	}
-	if !done {
-		lines = append(lines, name+"="+value)
-	}
-	return writeKeepingOwner(path, []byte(strings.Join(lines, "\n")+"\n"))
+	return keepOwner(stateDir, keyPath)
 }
 
 // writeKeepingOwner replaces a file atomically with mode 0600 and, when it

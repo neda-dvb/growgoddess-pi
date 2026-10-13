@@ -22,6 +22,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -71,6 +72,17 @@ func main() {
 	if v := strings.TrimSpace(os.Getenv("CANNABITS_API_KEY")); v != "" {
 		key = v
 	}
+	// the gateway's own key (enroll, rotation) wins over every other source
+	if cfg.SpoolDir != "" {
+		own, err := gateway.ReadKeyFile(cfg.StateKeyPath())
+		if err != nil {
+			log.Fatalf("read %s: %v", cfg.StateKeyPath(), err)
+		}
+		if own != "" {
+			key = own
+			log.Printf("key: this gateway's own key %s... from %s", own[:min(12, len(own))], cfg.StateKeyPath())
+		}
+	}
 	if problems := cfg.EdgeProblems(*insecureLocalhost); len(problems) > 0 {
 		log.Fatalf("config problems:\n  %s", strings.Join(problems, "\n  "))
 	}
@@ -102,6 +114,7 @@ func main() {
 	}
 	client := gateway.NewClient(cfg.API, cfg.PlanID, key, cfg.GatewayLabel)
 	syncFilter := &gateway.SyncFilter{Policy: cfg.SyncPolicy, Local: cfg.LocalStore()}
+	auth := &gateway.AuthState{Logf: log.Printf}
 	mode := cfg.DataMode()
 	flushEvery := time.Duration(cfg.FlushSeconds) * time.Second
 	if flushEvery <= 0 {
@@ -157,13 +170,9 @@ func main() {
 				ID: gateway.BatchID(cfg.GatewayLabel, time.Now()), DataMode: mode,
 				Created: time.Now().UTC(), Readings: send,
 			}
-			if dropped, err := spool.Put(batch); err != nil {
-				log.Printf("spool write: %v", err)
-			} else if len(dropped) > 0 {
-				log.Printf("SPOOL FULL: dropped %d oldest batch(es) - data lost: %v", len(dropped), dropped)
-			}
+			spoolPut(spool, auth, batch)
 		}
-		drain(spool, client)
+		drain(spool, client, auth)
 	}
 
 	for {
@@ -181,14 +190,32 @@ func main() {
 	}
 }
 
-// drain sends spooled batches oldest first, stopping at the first network
-// failure (order is preserved; the rest waits for the next tick).
-func drain(spool *gateway.Spool, client *gateway.Client) {
+// spoolPut stores a batch before any send. While the platform refuses the
+// key the spool is held: nothing is dropped, and once even the raised bound
+// is reached the new batch is not recorded, loudly, so what is stored stays.
+func spoolPut(spool *gateway.Spool, auth *gateway.AuthState, batch gateway.Batch) {
+	spool.SetHold(auth.Unauthorised())
+	dropped, err := spool.Put(batch)
+	switch {
+	case errors.Is(err, gateway.ErrSpoolHeld):
+		log.Printf("UNAUTHORISED AND SPOOL FULL: batch %s NOT RECORDED (%d readings); every stored batch is kept. Enroll again: cannabits-gateway enroll <code>", batch.ID, len(batch.Readings))
+	case err != nil:
+		log.Printf("spool write: %v", err)
+	case len(dropped) > 0:
+		log.Printf("SPOOL FULL: dropped %d oldest batch(es) - data lost: %v", len(dropped), dropped)
+	}
+}
+
+// drain sends spooled batches oldest first, stopping at the first failure
+// (order is preserved; the rest waits for the next tick). A refused key
+// enters the unauthorised state; an accepted batch leaves it.
+func drain(spool *gateway.Spool, client *gateway.Client, auth *gateway.AuthState) {
 	ids, err := spool.Pending()
 	if err != nil {
 		log.Printf("spool list: %v", err)
 		return
 	}
+	defer func() { auth.Tick(time.Now(), len(ids)) }()
 	for _, id := range ids {
 		b, err := spool.Get(id)
 		if err != nil {
@@ -196,8 +223,11 @@ func drain(spool *gateway.Spool, client *gateway.Client) {
 			continue
 		}
 		res, err := client.Send(b)
+		auth.Observe(err, time.Now())
 		if err != nil {
-			log.Printf("send %s: %v (kept in spool)", id, err)
+			if !auth.Unauthorised() {
+				log.Printf("send %s: %v (kept in spool)", id, err)
+			}
 			return
 		}
 		note := ""

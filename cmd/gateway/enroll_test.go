@@ -17,7 +17,10 @@ func enrollFiles(t *testing.T, api string) (cfg, env string) {
 	dir := t.TempDir()
 	cfg = filepath.Join(dir, "gateway.json")
 	env = filepath.Join(dir, "gateway.env")
-	if err := os.WriteFile(cfg, []byte(`{"_comment":"keep me","planId":"REPLACE_WITH_PLAN_UUID","gatewayLabel":"cannaru-pi","allowControl":false}`), 0o644); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "state", "spool"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfg, []byte(`{"_comment":"keep me","planId":"REPLACE_WITH_PLAN_UUID","gatewayLabel":"cannaru-pi","allowControl":false,"spoolDir":"`+filepath.Join(dir, "state", "spool")+`"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(env, []byte("# comment\nCANNABITS_API_URL="+api+"\nCANNABITS_API_KEY=cbk_replace_me\n"), 0o600); err != nil {
@@ -50,17 +53,19 @@ func TestEnrollStoresTheKeyAndPlan(t *testing.T) {
 	if gotCode != "7KQ2-M9XD-4TRB" {
 		t.Errorf("code sent = %q", gotCode)
 	}
-	rawEnv, _ := os.ReadFile(env)
-	if !strings.Contains(string(rawEnv), "CANNABITS_API_KEY=cbk_newkey0123456789\n") || strings.Contains(string(rawEnv), "cbk_replace_me") ||
-		!strings.Contains(string(rawEnv), "# comment\n") || !strings.Contains(string(rawEnv), "CANNABITS_API_URL="+srv.URL) {
-		t.Errorf("env file: %q", rawEnv)
+	keyPath := filepath.Join(filepath.Dir(cfg), "state", "gateway.key")
+	if key, _ := os.ReadFile(keyPath); string(key) != "cbk_newkey0123456789\n" {
+		t.Errorf("key file: %q", key)
+	}
+	if rawEnv, _ := os.ReadFile(env); !strings.Contains(string(rawEnv), "CANNABITS_API_KEY=cbk_replace_me") {
+		t.Errorf("the env file is left alone (the key file wins over it): %q", rawEnv)
 	}
 	var conf map[string]any
 	rawCfg, _ := os.ReadFile(cfg)
 	if err := json.Unmarshal(rawCfg, &conf); err != nil || conf["planId"] != "p-1" || conf["_comment"] != "keep me" || conf["gatewayLabel"] != "cannaru-pi" {
 		t.Errorf("config: %s (%v)", rawCfg, err)
 	}
-	for _, p := range []string{env, cfg} {
+	for _, p := range []string{keyPath, cfg} {
 		if fi, _ := os.Stat(p); fi.Mode().Perm() != 0o600 {
 			t.Errorf("%s mode %v, want 0600", filepath.Base(p), fi.Mode().Perm())
 		}
@@ -92,5 +97,8 @@ func TestEnrollRefusesPlainHTTPAndARefusedCode(t *testing.T) {
 	}
 	if after, _ := os.ReadFile(env); !bytes.Equal(before, after) {
 		t.Error("a failed enrollment must leave the env file untouched")
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(cfg), "state", "gateway.key")); !os.IsNotExist(err) {
+		t.Error("a failed enrollment must not write a key")
 	}
 }

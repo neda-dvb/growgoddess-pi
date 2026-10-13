@@ -81,6 +81,9 @@ func (c *Client) Send(b Batch) (SendResult, error) {
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return SendResult{}, fmt.Errorf("rate limited; retrying later")
 	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return SendResult{}, fmt.Errorf("%w: HTTP %d: %s", ErrUnauthorized, resp.StatusCode, receipt.Error)
+	}
 	if resp.StatusCode >= 400 {
 		return SendResult{}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, receipt.Error)
 	}
