@@ -35,6 +35,9 @@ type Reading struct {
 	Value       float64 `json:"value"`
 	Probe       string  `json:"probe,omitempty"`
 	ValueOrigin string  `json:"valueOrigin,omitempty"`
+	// DerivationMethod names how a derived value was computed (hourly_mean
+	// under the aggregated sync policy).
+	DerivationMethod string `json:"derivationMethod,omitempty"`
 	// ZoneID/DeviceID place a reading in a sub-zone of the room and name the
 	// device it came from. Empty on room-level sources (e.g. OptiClimate),
 	// which the platform stores as room-level (zone_id NULL) unchanged.
@@ -110,7 +113,7 @@ func NewSpool(dir string, maxBatches int) (*Spool, error) {
 	if maxBatches <= 0 {
 		maxBatches = 5760
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	return &Spool{Dir: dir, MaxBatches: maxBatches}, nil
@@ -128,7 +131,7 @@ func (s *Spool) Put(b Batch) ([]string, error) {
 		return nil, err
 	}
 	tmp := s.path(b.ID) + ".tmp"
-	if err := os.WriteFile(tmp, buf, 0o644); err != nil {
+	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
 		return nil, err
 	}
 	if err := os.Rename(tmp, s.path(b.ID)); err != nil {
@@ -220,6 +223,50 @@ type Config struct {
 	// explicitly configured for control refuses every write command and
 	// reports "control disabled", whatever the backend asks.
 	AllowControl bool `json:"allowControl,omitempty"`
+	// GuardBand bounds every setpoint write on this gateway, whatever the
+	// backend asks (defaults 15 to 32 °C, 30 to 85 %RH).
+	GuardBand GuardBand `json:"guardBand,omitempty"`
+	// ControllerNetworks are the only networks (CIDR) the gateway reaches a
+	// controller in, besides boxes its own LAN scan found. Default: the
+	// private and link-local ranges. Every entry must be private.
+	ControllerNetworks []string `json:"controllerNetworks,omitempty"`
+	// SyncPolicy is what this gateway sends: full (default), aggregated
+	// (hourly means) or local_only. The stricter of this and the backend's
+	// policy for the gateway applies.
+	SyncPolicy string `json:"syncPolicy,omitempty"`
+	// LocalDir keeps the raw readings under aggregated and local_only
+	// (default: "local" next to the spool) for LocalRetentionDays (default 7).
+	LocalDir           string `json:"localDir,omitempty"`
+	LocalRetentionDays int    `json:"localRetentionDays,omitempty"`
+}
+
+// EdgeProblems checks the security settings, for static and agent mode
+// alike: the API URL scheme, the guard band, the controller networks and
+// the sync policy. Any problem stops the gateway at startup.
+func (c Config) EdgeProblems(allowInsecureLocalhost bool) []string {
+	var problems []string
+	if c.API != "" {
+		if err := ValidateAPIURL(c.API, allowInsecureLocalhost); err != nil {
+			problems = append(problems, err.Error())
+		}
+	}
+	problems = append(problems, c.GuardBand.Problems()...)
+	if _, err := ParseControllerNetworks(c.ControllerNetworks); err != nil {
+		problems = append(problems, err.Error())
+	}
+	if !ValidSyncPolicy(c.SyncPolicy) {
+		problems = append(problems, fmt.Sprintf("syncPolicy %q: use full, aggregated or local_only", c.SyncPolicy))
+	}
+	return problems
+}
+
+// LocalStore is where readings stay under aggregated and local_only.
+func (c Config) LocalStore() *LocalStore {
+	dir := c.LocalDir
+	if dir == "" {
+		dir = filepath.Join(filepath.Dir(filepath.Clean(c.SpoolDir)), "local")
+	}
+	return &LocalStore{Dir: dir, RetentionDays: c.LocalRetentionDays}
 }
 
 // Validate enforces the contract, including the honesty rule.

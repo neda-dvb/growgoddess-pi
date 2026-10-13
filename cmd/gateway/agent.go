@@ -9,8 +9,14 @@
 // exact same proven path as static mode.
 //
 // Control: the agent also polls controller commands (test, read settings,
-// set a setpoint). Writes run only with "allowControl": true in the config;
-// see performCommand.
+// set a setpoint). Writes run only with "allowControl": true in the config,
+// and only inside the gateway's own guard band; see performCommand.
+//
+// The agent reaches a controller only at an address inside its controller
+// networks (private ranges by default) or one its own LAN scan found, for a
+// room binding from the config as for a command: the backend cannot point
+// the Pi at the internet or at itself. The sync policy is the stricter of
+// gateway.json's and the one the backend serves for this gateway.
 package main
 
 import (
@@ -24,6 +30,7 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -73,6 +80,46 @@ type agentConfigResp struct {
 	Rooms       []agentRoom   `json:"rooms"`
 	Devices     []agentDevice `json:"devices"`
 	GoveeAPIKey string        `json:"goveeApiKey"`
+	// set when this gateway authenticated with its own key
+	GatewayID  string `json:"gatewayId"`
+	SyncPolicy string `json:"syncPolicy"`
+}
+
+// hostSet is the controllers this gateway's own LAN scans found; safe for
+// the scan goroutines.
+type hostSet struct {
+	mu    sync.Mutex
+	hosts map[string]bool
+}
+
+func (h *hostSet) add(host string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.hosts == nil {
+		h.hosts = map[string]bool{}
+	}
+	h.hosts[host] = true
+}
+
+func (h *hostSet) has(host string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.hosts[host]
+}
+
+// commandGates are the gateway's own refusals, whatever a command asks.
+type commandGates struct {
+	AllowControl bool
+	Band         gateway.GuardBand
+	// HostAllowed: may the gateway reach this controller address? nil
+	// refuses every address.
+	HostAllowed func(host string) bool
+	// Discovered records the boxes a scan found (nil: not recorded).
+	Discovered *hostSet
+}
+
+func (g commandGates) hostAllowed(host string) bool {
+	return g.HostAllowed != nil && g.HostAllowed(host)
 }
 
 func fetchGatewayConfig(api, planID, key string) (agentConfigResp, error) {
@@ -106,6 +153,17 @@ func runAgent(cfg gateway.Config, key string) {
 		log.Fatalf("spool: %v", err)
 	}
 	client := gateway.NewClient(cfg.API, cfg.PlanID, key, cfg.GatewayLabel)
+	nets, err := gateway.ParseControllerNetworks(cfg.ControllerNetworks)
+	if err != nil {
+		log.Fatalf("%v", err) // EdgeProblems already refused it; never reach any host on a bad list
+	}
+	discovered := &hostSet{}
+	gates := commandGates{
+		AllowControl: cfg.AllowControl, Band: cfg.GuardBand, Discovered: discovered,
+		HostAllowed: func(host string) bool { return gateway.HostInNetworks(host, nets) || discovered.has(host) },
+	}
+	syncFilter := &gateway.SyncFilter{Policy: gateway.StricterPolicy(cfg.SyncPolicy, ""), Local: cfg.LocalStore()}
+	refusedHost := map[string]string{} // zone -> refused host, so the log says it once
 
 	flushEvery := time.Duration(cfg.FlushSeconds) * time.Second
 	if flushEvery <= 0 {
@@ -117,8 +175,10 @@ func runAgent(cfg gateway.Config, key string) {
 	}
 	const sampleEvery = 60 * time.Second // per-controller read cadence
 
-	log.Printf("gateway agent %s: plan %s, config poll %s, flush %s, spool %s, control %s",
-		cfg.GatewayLabel, cfg.PlanID, pollEvery, flushEvery, cfg.SpoolDir, map[bool]string{true: "ENABLED", false: "disabled"}[cfg.AllowControl])
+	band := cfg.GuardBand.Effective()
+	log.Printf("gateway agent %s: plan %s, config poll %s, flush %s, spool %s, control %s (guard band %g-%g °C, %g-%g %%RH), controller networks %v, sync %s",
+		cfg.GatewayLabel, cfg.PlanID, pollEvery, flushEvery, cfg.SpoolDir, map[bool]string{true: "ENABLED", false: "disabled"}[cfg.AllowControl],
+		band.TempMin, band.TempMax, band.RHMin, band.RHMax, nets, syncFilter.Policy)
 
 	// Govee (and future cloud vendors) need a vendor API key. The agent holds
 	// it in its own environment; the backend never serves it in the config.
@@ -150,9 +210,21 @@ func runAgent(cfg gateway.Config, key string) {
 			log.Printf("agent config poll: %v", err)
 			return
 		}
+		if p := gateway.StricterPolicy(cfg.SyncPolicy, conf.SyncPolicy); p != syncFilter.Policy {
+			log.Printf("agent: sync policy %s (gateway.json %q, platform %q)", p, cfg.SyncPolicy, conf.SyncPolicy)
+			syncFilter.Policy = p
+		}
 		want := map[string]agentController{}
 		for _, r := range conf.Rooms {
 			if r.Controller != nil && strings.ToLower(r.Controller.Vendor) == "opticlimate" && r.Controller.Host != "" {
+				if !gates.hostAllowed(r.Controller.Host) {
+					if refusedHost[r.ZoneID] != r.Controller.Host {
+						log.Printf("agent: REFUSED controller %s for zone %s: outside this gateway's controller networks", r.Controller.Host, r.ZoneID)
+						refusedHost[r.ZoneID] = r.Controller.Host
+					}
+					continue
+				}
+				delete(refusedHost, r.ZoneID)
 				want[r.ZoneID] = *r.Controller
 			}
 		}
@@ -252,12 +324,16 @@ func runAgent(cfg gateway.Config, key string) {
 	var pendingEvents []gateway.Event
 
 	flushNow := func() {
-		if len(pending) > 0 || len(pendingEvents) > 0 {
+		send, err := syncFilter.Filter(pending, time.Now())
+		if err != nil {
+			log.Printf("sync policy: %v", err)
+		}
+		pending = nil
+		if len(send) > 0 || len(pendingEvents) > 0 {
 			batch := gateway.Batch{
 				ID: gateway.BatchID(cfg.GatewayLabel, time.Now()), DataMode: "live",
-				Created: time.Now().UTC(), Readings: pending, Events: pendingEvents,
+				Created: time.Now().UTC(), Readings: send, Events: pendingEvents,
 			}
-			pending = nil
 			pendingEvents = nil
 			if dropped, err := spool.Put(batch); err != nil {
 				log.Printf("spool write: %v", err)
@@ -305,12 +381,12 @@ func runAgent(cfg gateway.Config, key string) {
 			run, ok := active[h.zone]
 			if ok && fails[h.zone] >= 3 && run.ctrl.MAC != "" && time.Since(lastRescan[h.zone]) > 5*time.Minute {
 				lastRescan[h.zone] = time.Now()
-				go refindController(cfg.API, cfg.PlanID, key, h.zone, run.ctrl)
+				go refindController(cfg.API, cfg.PlanID, key, h.zone, run.ctrl, discovered)
 			}
 		case <-poll.C:
 			reconcile()
 		case <-cmds.C:
-			pollCommands(cfg.API, cfg.PlanID, key, cfg.AllowControl)
+			pollCommands(cfg.API, cfg.PlanID, key, gates)
 		case <-flush.C:
 			flushNow()
 		case <-sig:
@@ -475,11 +551,14 @@ func postControllerJSON(api, planID, key, what string, body map[string]any) {
 // refindController scans the LAN for a room's box by MAC after its address
 // stopped answering, and reports the new address. The platform updates the
 // binding; the next config poll restarts the source at the new host.
-func refindController(api, planID, key, zone string, ctrl agentController) {
+func refindController(api, planID, key, zone string, ctrl agentController, discovered *hostSet) {
 	hosts, _ := gateway.LocalIPv4Hosts()
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 	res := gateway.DiscoverOptiClimate(ctx, hosts, 4001, 400*time.Millisecond, 64)
+	for _, c := range res.Controllers {
+		discovered.add(c.Host)
+	}
 	for _, c := range res.Controllers {
 		if c.MAC != "" && c.MAC == ctrl.MAC && c.Host != ctrl.Host {
 			log.Printf("agent: controller for zone %s moved: %s -> %s (MAC %s)", zone, ctrl.Host, c.Host, c.MAC)
@@ -504,8 +583,9 @@ func commandExpired(c agentCommand, now time.Time) bool {
 }
 
 // performCommand runs one command and returns (ok, result, error message).
-// It is the single dispatch point; the allowControl gate lives here.
-func performCommand(c agentCommand, allowControl bool, now time.Time) (bool, map[string]any, string) {
+// It is the single dispatch point; the gateway's own gates live here: the
+// controller address, allowControl and the guard band.
+func performCommand(c agentCommand, g commandGates, now time.Time) (bool, map[string]any, string) {
 	if strings.ToLower(c.Controller.Vendor) != "opticlimate" {
 		return false, nil, "unsupported controller"
 	}
@@ -514,6 +594,9 @@ func performCommand(c agentCommand, allowControl bool, now time.Time) (bool, map
 	}
 	if commandExpired(c, now) {
 		return false, nil, "the command expired before the gateway performed it"
+	}
+	if c.Kind != "discover" && !g.hostAllowed(c.Controller.Host) {
+		return false, nil, "the controller address is outside this gateway's controller networks"
 	}
 	switch c.Kind {
 	case "test":
@@ -532,6 +615,11 @@ func performCommand(c agentCommand, allowControl bool, now time.Time) (bool, map
 		defer cancel()
 		res := gateway.DiscoverOptiClimate(ctx, hosts, 4001, 400*time.Millisecond, 64)
 		res.Subnets = subnets
+		if g.Discovered != nil {
+			for _, found := range res.Controllers {
+				g.Discovered.add(found.Host)
+			}
+		}
 		log.Printf("agent: discovery scanned %d hosts on %v in %d ms, found %d controller(s)", res.ScannedHosts, subnets, res.DurationMs, len(res.Controllers))
 		return true, map[string]any{"controllers": res.Controllers, "scannedHosts": res.ScannedHosts, "durationMs": res.DurationMs, "subnets": res.Subnets}, ""
 	case "read_settings":
@@ -542,7 +630,7 @@ func performCommand(c agentCommand, allowControl bool, now time.Time) (bool, map
 		}
 		return true, map[string]any{"settings": settings}, ""
 	case "set_setpoint":
-		if !allowControl {
+		if !g.AllowControl {
 			return false, nil, "control is disabled on this gateway (allowControl is off)"
 		}
 		key, _ := c.Payload["setpoint"].(string)
@@ -550,7 +638,7 @@ func performCommand(c agentCommand, allowControl bool, now time.Time) (bool, map
 		if key == "" || !ok {
 			return false, nil, "malformed setpoint command"
 		}
-		ctl := &gateway.OptiClimateControl{URL: controllerURL(c.Controller), Address: c.Controller.Address}
+		ctl := &gateway.OptiClimateControl{URL: controllerURL(c.Controller), Address: c.Controller.Address, Band: g.Band}
 		res, err := ctl.SetSetpoint(key, value)
 		if err != nil {
 			return false, nil, err.Error()
@@ -565,7 +653,7 @@ func performCommand(c agentCommand, allowControl bool, now time.Time) (bool, map
 
 var lastCommandsPollError time.Time
 
-func pollCommands(api, planID, key string, allowControl bool) {
+func pollCommands(api, planID, key string, gates commandGates) {
 	cmds, err := fetchGatewayCommands(api, planID, key)
 	if err != nil {
 		// the poll runs every 5s; log a failing backend once a minute, not 12 times
@@ -577,7 +665,7 @@ func pollCommands(api, planID, key string, allowControl bool) {
 	}
 	for _, c := range cmds {
 		now := time.Now()
-		ok, result, errMsg := performCommand(c, allowControl, now)
+		ok, result, errMsg := performCommand(c, gates, now)
 		switch {
 		case c.Kind == "set_setpoint" && ok:
 			log.Printf("CONTROL: %s zone %s %s -> %s %v (was %v, read back %v) [%s]",

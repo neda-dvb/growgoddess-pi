@@ -8,6 +8,11 @@
 //
 //	go run ./cmd/gateway -config gateway.json
 //
+// Enroll a new gateway once, with the one-time code from Grow Goddess Pro
+// (stores the gateway's own key in the env file, the plan id in the config):
+//
+//	sudo cannabits-gateway enroll [-config f] [-env-file f] <code>
+//
 // Cross-compile for a Raspberry Pi:
 //
 //	GOOS=linux GOARCH=arm64 go build -o cannabits-gateway ./cmd/gateway
@@ -31,7 +36,11 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "enroll" {
+		os.Exit(runEnroll(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	configPath := flag.String("config", "gateway.json", "gateway configuration file")
+	insecureLocalhost := flag.Bool("insecure-localhost", false, "allow a plain http API URL for a backend on localhost (development only)")
 	modbusInspect := flag.Bool("modbus-inspect", false, "listen on the modbus source and print every observed register; nothing is sent anywhere")
 	agentMode := flag.Bool("agent", false, "facility-agent mode: pull room/controller config from the backend and stream every connected room")
 	flag.Parse()
@@ -62,6 +71,9 @@ func main() {
 	if v := strings.TrimSpace(os.Getenv("CANNABITS_API_KEY")); v != "" {
 		key = v
 	}
+	if problems := cfg.EdgeProblems(*insecureLocalhost); len(problems) > 0 {
+		log.Fatalf("config problems:\n  %s", strings.Join(problems, "\n  "))
+	}
 
 	// Agent mode: the gateway pulls its room/controller config from the
 	// backend and streams every connected room. No static zone/sources.
@@ -89,13 +101,14 @@ func main() {
 		log.Fatalf("spool: %v", err)
 	}
 	client := gateway.NewClient(cfg.API, cfg.PlanID, key, cfg.GatewayLabel)
+	syncFilter := &gateway.SyncFilter{Policy: cfg.SyncPolicy, Local: cfg.LocalStore()}
 	mode := cfg.DataMode()
 	flushEvery := time.Duration(cfg.FlushSeconds) * time.Second
 	if flushEvery <= 0 {
 		flushEvery = time.Minute
 	}
-	log.Printf("gateway %s: %d source(s), dataMode %s, flush every %s, spool %s",
-		cfg.GatewayLabel, len(sources), mode, flushEvery, cfg.SpoolDir)
+	log.Printf("gateway %s: %d source(s), dataMode %s, flush every %s, spool %s, sync %s",
+		cfg.GatewayLabel, len(sources), mode, flushEvery, cfg.SpoolDir, gateway.StricterPolicy(cfg.SyncPolicy, ""))
 	if pending, _ := spool.Pending(); len(pending) > 0 {
 		log.Printf("spool holds %d batch(es) from a previous run; they drain first", len(pending))
 	}
@@ -134,12 +147,16 @@ func main() {
 	var pending []gateway.Reading
 
 	flushNow := func() {
-		if len(pending) > 0 {
+		send, err := syncFilter.Filter(pending, time.Now())
+		if err != nil {
+			log.Printf("sync policy: %v", err)
+		}
+		pending = nil
+		if len(send) > 0 {
 			batch := gateway.Batch{
 				ID: gateway.BatchID(cfg.GatewayLabel, time.Now()), DataMode: mode,
-				Created: time.Now().UTC(), Readings: pending,
+				Created: time.Now().UTC(), Readings: send,
 			}
-			pending = nil
 			if dropped, err := spool.Put(batch); err != nil {
 				log.Printf("spool write: %v", err)
 			} else if len(dropped) > 0 {

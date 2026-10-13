@@ -65,6 +65,9 @@ type OptiClimateControl struct {
 	// Zero means the defaults: 8 attempts, 1.5 s apart (12 s in total).
 	ReadbackAttempts int
 	ReadbackDelay    time.Duration
+	// Band is the gateway's own guard band, checked before the controller is
+	// touched. The zero value is the default band, never "no band".
+	Band GuardBand
 }
 
 func (c *OptiClimateControl) readbackPlan() (int, time.Duration) {
@@ -143,12 +146,16 @@ type WriteResult struct {
 }
 
 // SetSetpoint writes one canonical setpoint and confirms it by read-back.
-// Order: read previous + alarm limits, check limits, POST, GET read-back.
+// Order: the gateway's guard band, read previous + alarm limits, check
+// limits, POST, GET read-back.
 // Any error before the POST means nothing was written.
 func (c *OptiClimateControl) SetSetpoint(key string, value float64) (WriteResult, error) {
 	reg, ok := OptiClimateSetpointRegisters[key]
 	if !ok {
 		return WriteResult{}, fmt.Errorf("opticlimate control: unknown setpoint %q", key)
+	}
+	if err := c.Band.Check(key, value); err != nil {
+		return WriteResult{}, err // refused before any call to the controller
 	}
 	names := []string{reg}
 	limits, hasLimits := optiClimateAlarmLimits[key]

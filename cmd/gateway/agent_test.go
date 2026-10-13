@@ -8,6 +8,12 @@ import (
 	"github.com/neda-dvb/growgoddess-pi/internal/gateway"
 )
 
+// testGates lets every controller address through, so a test reaches the
+// gate it is about.
+func testGates(allowControl bool) commandGates {
+	return commandGates{AllowControl: allowControl, HostAllowed: func(string) bool { return true }}
+}
+
 // TestPerformCommandGates pins the two gates that need no controller: a
 // write without allowControl is refused, and an expired command is never
 // performed, whatever its kind.
@@ -17,24 +23,24 @@ func TestPerformCommandGates(t *testing.T) {
 
 	ok, _, msg := performCommand(agentCommand{Kind: "set_setpoint", Controller: ctrl,
 		Payload:   map[string]any{"setpoint": "temp_day", "value": 28.0},
-		ExpiresAt: now.Add(time.Minute).Format(time.RFC3339)}, false, now)
+		ExpiresAt: now.Add(time.Minute).Format(time.RFC3339)}, testGates(false), now)
 	if ok || msg == "" || msg[:len("control is disabled")] != "control is disabled" {
 		t.Fatalf("write without allowControl must be refused, got ok=%v msg=%q", ok, msg)
 	}
 
 	ok, _, msg = performCommand(agentCommand{Kind: "set_setpoint", Controller: ctrl,
 		Payload:   map[string]any{"setpoint": "temp_day", "value": 28.0},
-		ExpiresAt: now.Add(-time.Second).Format(time.RFC3339)}, true, now)
+		ExpiresAt: now.Add(-time.Second).Format(time.RFC3339)}, testGates(true), now)
 	if ok || msg != "the command expired before the gateway performed it" {
 		t.Fatalf("expired write must not run, got ok=%v msg=%q", ok, msg)
 	}
 
-	ok, _, msg = performCommand(agentCommand{Kind: "test", Controller: agentController{Vendor: "trolmaster", Host: "x"}}, true, now)
+	ok, _, msg = performCommand(agentCommand{Kind: "test", Controller: agentController{Vendor: "trolmaster", Host: "x"}}, testGates(true), now)
 	if ok || msg != "unsupported controller" {
 		t.Fatalf("unknown vendor must be refused, got ok=%v msg=%q", ok, msg)
 	}
 
-	ok, _, msg = performCommand(agentCommand{Kind: "set_setpoint", Controller: ctrl, Payload: map[string]any{"setpoint": "temp_day"}}, true, now)
+	ok, _, msg = performCommand(agentCommand{Kind: "set_setpoint", Controller: ctrl, Payload: map[string]any{"setpoint": "temp_day"}}, testGates(true), now)
 	if ok || msg != "malformed setpoint command" {
 		t.Fatalf("missing value must be refused before any network call, got ok=%v msg=%q", ok, msg)
 	}
@@ -56,7 +62,7 @@ func TestSameTarget(t *testing.T) {
 	}
 	// a discover command needs no host; every other kind does
 	now := time.Now()
-	if ok, _, msg := performCommand(agentCommand{Kind: "read_settings", Controller: agentController{Vendor: "opticlimate"}}, true, now); ok || msg != "no controller address" {
+	if ok, _, msg := performCommand(agentCommand{Kind: "read_settings", Controller: agentController{Vendor: "opticlimate"}}, testGates(true), now); ok || msg != "no controller address" {
 		t.Errorf("read_settings without a host must be refused, got %v %q", ok, msg)
 	}
 }
