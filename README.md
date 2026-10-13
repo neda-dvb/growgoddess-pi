@@ -39,11 +39,16 @@ On the Pi (64-bit Raspberry Pi OS), with Go installed:
 git clone https://github.com/neda-dvb/growgoddess-pi.git
 cd growgoddess-pi
 sudo ./install.sh
-sudo nano /etc/cannabits/gateway.env    # CANNABITS_API_KEY=cbk_...
-sudo nano /etc/cannabits/gateway.json   # planId + gatewayLabel
-sudo systemctl start cannabits-gateway
+# Grow Goddess Pro: facility settings, Gateways, Add gateway -> a one-time code
+sudo cannabits-gateway enroll 7KQ2-M9XD-4TRB   # stores this gateway's own key and the plan id
+sudo nano /etc/cannabits/gateway.json          # gatewayLabel, and the options below
+sudo systemctl restart cannabits-gateway
 journalctl -u cannabits-gateway -f
 ```
+
+The code works once and for 15 minutes. `Rotate` in the app gives a new
+code; running `enroll` with it replaces the key, and the old key stops
+working at that moment. `Revoke` ends the gateway for good.
 
 No Go on the Pi? Cross-compile on your Mac and copy the folder over:
 
@@ -62,6 +67,9 @@ Secrets and the API host come from the environment
 CANNABITS_API_URL=https://growgoddess.club
 CANNABITS_API_KEY=cbk_...
 ```
+
+`enroll` writes the `CANNABITS_API_KEY` line itself. A plan key minted in
+the app still works there instead.
 
 Everything else is `/etc/cannabits/gateway.json`. **Agent mode** (the default in
 the systemd unit) keeps it tiny — the Pi pulls each room's controller from the
@@ -92,7 +100,8 @@ it; the boxes drop idle Wi-Fi connections silently.
 Since 2026-09-10 the gateway can also WRITE the four room setpoints
 (temperature and humidity, day and night) that an operator changes in
 Grow Goddess Pro. The platform queues a command; the gateway polls it (every
-5 s, the same poll as Test Connection), checks the value against the
+5 s, the same poll as Test Connection), checks the value against its own
+guard band (see Security below) and the
 controller's own alarm limits, writes ONE register with
 `POST /backend/setRegisterValues`, reads it back, and reports the outcome.
 Nothing is written unless `gateway.json` says so:
@@ -147,6 +156,49 @@ Since 2026-09-13 the Pi accepts SSH by key only (`/etc/ssh/sshd_config.d/50-cann
 and listens on port 22 alone (rpcbind is disabled). To reach it from a new
 machine, add that machine's public key to `~neda/.ssh/authorized_keys` first,
 from a machine that already has access.
+
+## Security on the Pi (2026-10-14)
+
+The gateway refuses these on its own, whatever the backend or a config asks:
+
+- **https only.** The API URL must be `https://`; the gateway stops at
+  startup otherwise. Plain `http://` works only for a backend on localhost,
+  with `-insecure-localhost` (development).
+- **Guard band.** A setpoint outside `guardBand` in `gateway.json` (default
+  15 to 32 °C and 30 to 85 %RH) is refused before the controller is touched,
+  even with `allowControl: true` and even when the platform asks.
+- **Controller networks.** The gateway reaches a controller (a room binding
+  from the config or a command) only at an IP inside `controllerNetworks`
+  (default: the private and link-local ranges; every entry must be private)
+  or at a box its own LAN scan found. Host names, loopback and public
+  addresses are refused and logged as `agent: REFUSED controller ...`.
+- **Its own user.** `install.sh` creates `cannabits-gateway`; the systemd
+  unit runs as that user with `ProtectSystem=strict`, `ProtectHome`,
+  `PrivateTmp`, no capabilities, write access only to
+  `/var/lib/cannabits-gateway`, and only IPv4, IPv6, Unix and netlink
+  sockets (netlink because the LAN scan reads the Pi's subnets from it).
+  The spool and local readings are 0700 directories with 0600 files;
+  `gateway.json` is 0600 for the service user, `gateway.env` 0600 for root.
+
+### Sync policy: what leaves the facility
+
+```json
+{ "syncPolicy": "aggregated", "localRetentionDays": 7 }
+```
+
+| `syncPolicy` | Sent to the cloud | Kept on the Pi |
+|---|---|---|
+| `full` (default) | every reading, once a minute | the spool until confirmed |
+| `aggregated` | one mean per sensor and hour, after the hour ends (`derivationMethod: hourly_mean`); on/off states are not sent | raw readings, `localRetentionDays` (default 7) |
+| `local_only` | only controller alarms and link status | raw readings, `localRetentionDays` |
+
+Alarms and link status go out under every policy. The owner can also set a
+policy per gateway in the app; the gateway applies the stricter of the two
+(logged as `agent: sync policy ...`), and the platform refuses what the
+policy forbids even if it arrives. Local readings live in
+`/var/lib/cannabits-gateway/local/readings-YYYY-MM-DD.jsonl` (or
+`localDir`); older days are deleted. A restart in the middle of an hour
+loses that hour's samples taken before it (aggregated).
 
 ## Verify from a different network (phone hotspot)
 
