@@ -40,15 +40,32 @@ git clone https://github.com/neda-dvb/growgoddess-pi.git
 cd growgoddess-pi
 sudo ./install.sh
 # Grow Goddess Pro: facility settings, Gateways, Add gateway -> a one-time code
-sudo cannabits-gateway enroll 7KQ2-M9XD-4TRB   # stores this gateway's own key and the plan id
+sudo cannabits-gateway enroll EA3D-7NBB-3H0W-22JE-TXQ8-1WMW-HP0B   # this gateway's own key and the plan id
 sudo nano /etc/cannabits/gateway.json          # gatewayLabel, and the options below
 sudo systemctl restart cannabits-gateway
 journalctl -u cannabits-gateway -f
 ```
 
-The code works once and for 15 minutes. `Rotate` in the app gives a new
-code; running `enroll` with it replaces the key, and the old key stops
-working at that moment. `Revoke` ends the gateway for good.
+The code (140 bits) works once and for 15 minutes. `enroll` keeps the key in
+`/var/lib/cannabits-gateway/gateway.key` (0600, the service user's), where it
+wins over `CANNABITS_API_KEY`. Once a gateway of a facility has enrolled, the
+facility's plan keys stop working, so a Pi still running on a plan key must
+enroll too.
+
+**Rotation** is the gateway's own: `Rotate` in the app only flags it, and on
+its next config poll the gateway asks for a new key with its current one,
+stores it in `gateway.key`, then confirms with the new key. Both keys work
+until the confirmation (at most 24 hours), so a failed step never locks the
+Pi out. A new enrollment code (a replaced Pi or SD card) also replaces the
+key. `Revoke` ends the gateway for good.
+
+**Unauthorised.** When the platform answers 401 or 403 (revoked, replaced, a
+retired plan key) the gateway keeps reading and spooling, logs
+`UNAUTHORISED ...` at once and then every hour, and never drops a batch
+because of it: the spool bound rises to ten times the normal one (about 40
+days), and only past that are new readings not recorded, each time with a
+loud `UNAUTHORISED AND SPOOL FULL` line. The first accepted call ends the
+state and the spool drains.
 
 No Go on the Pi? Cross-compile on your Mac and copy the folder over:
 
@@ -68,8 +85,8 @@ CANNABITS_API_URL=https://growgoddess.club
 CANNABITS_API_KEY=cbk_...
 ```
 
-`enroll` writes the `CANNABITS_API_KEY` line itself. A plan key minted in
-the app still works there instead.
+A plan key minted in the app works there for a facility whose gateways have
+not enrolled yet; `enroll` stores the gateway's own key elsewhere (above).
 
 Everything else is `/etc/cannabits/gateway.json`. **Agent mode** (the default in
 the systemd unit) keeps it tiny — the Pi pulls each room's controller from the

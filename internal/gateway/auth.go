@@ -38,7 +38,7 @@ func (a *AuthState) Observe(err error, now time.Time) {
 	case errors.Is(err, ErrUnauthorized):
 		if a.since.IsZero() {
 			a.since, a.lastLog = now, now
-			a.logf("UNAUTHORISED: the platform refuses this gateway's key (%v). Readings keep spooling and nothing is dropped; enroll again with a new code: cannabits-gateway enroll <code>", err)
+			a.logf("UNAUTHORISED: %v. Readings keep spooling and nothing is dropped; enroll again with a new code: cannabits-gateway enroll <code>", err)
 		}
 	case err == nil:
 		if !a.since.IsZero() {

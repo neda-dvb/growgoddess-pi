@@ -75,7 +75,7 @@ cat <<EOT
 Installed. Enroll, then start:
 
   1. In Grow Goddess Pro: facility settings, Gateways, Add gateway. Copy the code.
-  2. sudo cannabits-gateway enroll <code>       # stores this gateway's own key and the plan id
+  2. sudo cannabits-gateway enroll <code>       # this gateway's own key ($STATE/gateway.key) and the plan id
   3. sudo systemctl restart cannabits-gateway
   4. journalctl -u cannabits-gateway -f         # each flush logs "sent ...: N stored"
 
