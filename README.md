@@ -63,8 +63,9 @@ key. `Revoke` ends the gateway for good.
 retired plan key) the gateway keeps reading and spooling, logs
 `UNAUTHORISED ...` at once and then every hour, and never drops a batch
 because of it: the spool bound rises to ten times the normal one (about 40
-days), and only past that are new readings not recorded, each time with a
-loud `UNAUTHORISED AND SPOOL FULL` line. The first accepted call ends the
+days), and new readings stop being recorded only past that, or earlier when
+the disk would keep less than `spoolMinFreePercent` free (default 10 %), each
+time with a loud `UNAUTHORISED AND SPOOL FULL` line naming the reason. The first accepted call ends the
 state and the spool drains.
 
 No Go on the Pi? Cross-compile on your Mac and copy the folder over:
