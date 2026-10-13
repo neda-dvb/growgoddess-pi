@@ -113,7 +113,7 @@ func TestCommandHostValidation(t *testing.T) {
 	g := commandGates{AllowControl: false, Discovered: found,
 		HostAllowed: func(h string) bool { return gateway.HostInNetworks(h, nets) || found.has(h) }}
 	refused := "the controller address is outside this gateway's controller networks"
-	for _, host := range []string{"8.8.8.8", "127.0.0.1", "192.168.3.7", "evil.example.com", "169.254.169.254"} {
+	for _, host := range []string{"198.51.100.7", "127.0.0.1", "192.168.3.7", "evil.invalid", "169.254.169.254"} {
 		for _, kind := range []string{"test", "read_settings", "set_setpoint"} {
 			ok, _, msg := performCommand(agentCommand{Kind: kind, Controller: agentController{Vendor: "opticlimate", Host: host},
 				Payload: map[string]any{"setpoint": "temp_day", "value": 25.0}}, g, now)

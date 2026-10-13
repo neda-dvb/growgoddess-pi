@@ -72,7 +72,7 @@ func TestEnrollStoresTheKeyAndPlan(t *testing.T) {
 
 func TestEnrollRefusesPlainHTTPAndARefusedCode(t *testing.T) {
 	t.Setenv("CANNABITS_API_URL", "")
-	cfg, env := enrollFiles(t, "http://growgoddess.club")
+	cfg, env := enrollFiles(t, "http://gateway-test.invalid")
 	before, _ := os.ReadFile(env)
 	var out, errOut bytes.Buffer
 	if code := runEnroll([]string{"-config", cfg, "-env-file", env, "7KQ2-M9XD-4TRB"}, &out, &errOut); code == 0 || !strings.Contains(errOut.String(), "https") {
