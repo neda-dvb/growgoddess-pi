@@ -1,8 +1,12 @@
 {
-  "_comment": "Agent mode: the Pi pulls each room's controller binding from the backend, so you connect the OptiClimate in the Cannabits Pro UI (host + port) and this file stays tiny. api and key come from gateway.env. Replace planId with your plan's UUID. allowControl: true lets this gateway WRITE setpoints the platform queues for its rooms; leave it false on a gateway that should only measure.",
+  "_comment": "Agent mode: the Pi pulls each room's controller binding from the backend, so you connect the OptiClimate in the Cannabits Pro UI (host + port) and this file stays tiny. api and key come from gateway.env; `cannabits-gateway enroll <code>` fills in planId. allowControl: true lets this gateway WRITE setpoints the platform queues for its rooms, and never outside guardBand. controllerNetworks: the only networks the gateway reaches a controller in (private ranges only; unset = all private ranges). syncPolicy: full, aggregated (hourly means) or local_only (readings stay here for localRetentionDays); the stricter of this and the platform's setting applies.",
   "planId": "REPLACE_WITH_PLAN_UUID",
   "gatewayLabel": "cannaru-pi",
   "spoolDir": "/var/lib/cannabits-gateway/spool",
   "configPollSeconds": 15,
-  "allowControl": false
+  "allowControl": false,
+  "guardBand": { "tempMin": 15, "tempMax": 32, "rhMin": 30, "rhMax": 85 },
+  "controllerNetworks": ["192.168.0.0/16"],
+  "syncPolicy": "full",
+  "localRetentionDays": 7
 }

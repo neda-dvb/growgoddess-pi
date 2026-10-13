@@ -6,13 +6,31 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Its own user, never root (install.sh creates it). The env file is read by
+# systemd before the switch, so it stays root:root 0600.
+User=cannabits-gateway
+Group=cannabits-gateway
 EnvironmentFile=/etc/cannabits/gateway.env
 # Agent mode: room/controller bindings come from the backend. Drop "-agent"
 # to run a static config with explicit sources instead (see README).
 ExecStart=/usr/local/bin/cannabits-gateway -config /etc/cannabits/gateway.json -agent
 Restart=always
 RestartSec=5
+
+# Hardening: the whole system read-only except the gateway's own state, no
+# home directories, a private /tmp, no capabilities, no privilege gain.
 NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/cannabits-gateway
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Network: IPv4/IPv6 to the backend and the controllers, Unix sockets for the
+# journal. AF_NETLINK is needed too: Go lists the Pi's own interfaces over
+# netlink, and "Find on the network" and the re-find scan read the subnets
+# from there; without it they scan nothing.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target
