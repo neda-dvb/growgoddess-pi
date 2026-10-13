@@ -112,6 +112,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("spool: %v", err)
 	}
+	spool.MinFreePercent = cfg.SpoolMinFreePercent
 	client := gateway.NewClient(cfg.API, cfg.PlanID, key, cfg.GatewayLabel)
 	syncFilter := &gateway.SyncFilter{Policy: cfg.SyncPolicy, Local: cfg.LocalStore()}
 	auth := &gateway.AuthState{Logf: log.Printf}
@@ -198,7 +199,7 @@ func spoolPut(spool *gateway.Spool, auth *gateway.AuthState, batch gateway.Batch
 	dropped, err := spool.Put(batch)
 	switch {
 	case errors.Is(err, gateway.ErrSpoolHeld):
-		log.Printf("UNAUTHORISED AND SPOOL FULL: batch %s NOT RECORDED (%d readings); every stored batch is kept. Enroll again: cannabits-gateway enroll <code>", batch.ID, len(batch.Readings))
+		log.Printf("UNAUTHORISED AND SPOOL FULL: batch %s NOT RECORDED (%d readings): %v; every stored batch is kept. Enroll again: cannabits-gateway enroll <code>", batch.ID, len(batch.Readings), err)
 	case err != nil:
 		log.Printf("spool write: %v", err)
 	case len(dropped) > 0:

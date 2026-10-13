@@ -165,6 +165,7 @@ func runAgent(cfg gateway.Config, key string) {
 	if err != nil {
 		log.Fatalf("spool: %v", err)
 	}
+	spool.MinFreePercent = cfg.SpoolMinFreePercent
 	client := gateway.NewClient(cfg.API, cfg.PlanID, key, cfg.GatewayLabel)
 	nets, err := gateway.ParseControllerNetworks(cfg.ControllerNetworks)
 	if err != nil {

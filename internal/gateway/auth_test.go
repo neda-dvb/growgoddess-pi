@@ -151,3 +151,52 @@ func TestRestartWithBacklogDropsNothing(t *testing.T) {
 		t.Fatalf("the backlog must survive a restart: dropped %v err %v", dropped, err)
 	}
 }
+
+// While held, the spool stops recording before the disk drops under its
+// free-space floor, and never deletes a stored batch for it. A fake small
+// filesystem stands in for the real one.
+func TestHeldSpoolStopsBeforeTheDiskFills(t *testing.T) {
+	const total = 1_000_000
+	free := uint64(120_000) // 12 %
+	s := spoolOf(t, 3, 100)
+	s.FreeSpace = func() (uint64, uint64, error) { return free, total, nil }
+	s.SetHold(true)
+	if _, err := put(t, s, 1); err != nil {
+		t.Fatalf("12%% free is above the 10%% floor: %v", err)
+	}
+	free = 99_000 // under 10 %
+	_, err := put(t, s, 2)
+	if !errors.Is(err, ErrSpoolHeld) || !strings.Contains(err.Error(), "disk") {
+		t.Fatalf("under the floor the batch must be refused with the reason: %v", err)
+	}
+	if ids, _ := s.Pending(); len(ids) != 1 || ids[0] != "gw-x-0001" {
+		t.Fatalf("nothing written, nothing deleted: %v", ids)
+	}
+	// the batch itself counts: 100,010 free would leave under 10 % after it
+	free = 100_010
+	if _, err := s.Put(Batch{ID: "gw-x-0003", Readings: make([]Reading, 200)}); !errors.Is(err, ErrSpoolHeld) {
+		t.Fatalf("a batch that would cross the floor is refused: %v", err)
+	}
+	// a configured floor applies
+	free = 150_000 // 15 %
+	s.MinFreePercent = 20
+	if _, err := put(t, s, 4); !errors.Is(err, ErrSpoolHeld) {
+		t.Fatalf("15%% free is under a 20%% floor: %v", err)
+	}
+	// not held: the normal bound rules, the disk floor does not apply
+	s.MinFreePercent = 0
+	free = 10_000
+	ns := spoolOf(t, 3, 0)
+	ns.FreeSpace = s.FreeSpace
+	if _, err := put(t, ns, 1); err != nil {
+		t.Fatalf("an unheld spool writes as before: %v", err)
+	}
+	// an unreadable disk leaves the batch-count bound only
+	s.FreeSpace = func() (uint64, uint64, error) { return 0, 0, errors.New("no statfs") }
+	if _, err := put(t, s, 5); err != nil {
+		t.Fatalf("unknown free space must not stop recording: %v", err)
+	}
+	if problems := (Config{SpoolMinFreePercent: 95}).EdgeProblems(false); len(problems) != 1 {
+		t.Fatalf("a floor above 90%% is a config problem: %v", problems)
+	}
+}

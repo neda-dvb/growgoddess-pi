@@ -111,6 +111,12 @@ type Spool struct {
 	// HoldMax bounds the spool while it is held (default 10 x MaxBatches,
 	// about 40 days at one batch a minute).
 	HoldMax int
+	// MinFreePercent: while held, a batch is not written when the spool's
+	// filesystem would keep less than this share free (default 10).
+	MinFreePercent float64
+	// FreeSpace reports the spool filesystem's free and total bytes; nil
+	// asks the system (statfs).
+	FreeSpace func() (free, total uint64, err error)
 	// hold: the platform refuses this gateway's key. Nothing is dropped; at
 	// HoldMax new batches are refused instead (ErrSpoolHeld), so what is
 	// stored is kept. backlog: a hold ended but the spool is still above
@@ -129,6 +135,28 @@ func (s *Spool) SetHold(on bool) {
 	if on {
 		s.backlog = true
 	}
+}
+
+// diskTooFull says why a held spool may not write size more bytes, or "".
+// When the free space cannot be read, only the batch-count bound applies.
+func (s *Spool) diskTooFull(size int) string {
+	min := s.MinFreePercent
+	if min <= 0 {
+		min = 10
+	}
+	read := s.FreeSpace
+	if read == nil {
+		read = func() (uint64, uint64, error) { return diskFree(s.Dir) }
+	}
+	free, total, err := read()
+	if err != nil || total == 0 {
+		return ""
+	}
+	left := float64(free) - float64(size)
+	if left/float64(total)*100 < min {
+		return fmt.Sprintf("the disk would keep %.1f%% free, below %g%%", left/float64(total)*100, min)
+	}
+	return ""
 }
 
 func (s *Spool) holdMax() int {
@@ -163,6 +191,10 @@ func (s *Spool) path(id string) string {
 // Put persists a batch before any send attempt. Returns the ids of batches
 // dropped to respect the bound (normally none).
 func (s *Spool) Put(b Batch) ([]string, error) {
+	buf, err := json.Marshal(b)
+	if err != nil {
+		return nil, err
+	}
 	keepAll := s.hold || s.backlog
 	if keepAll {
 		ids, err := s.Pending()
@@ -173,12 +205,12 @@ func (s *Spool) Put(b Batch) ([]string, error) {
 		case !s.hold && len(ids) < s.MaxBatches:
 			s.backlog, keepAll = false, false // drained back under the normal bound
 		case len(ids) >= s.holdMax():
-			return nil, ErrSpoolHeld
+			return nil, fmt.Errorf("%w (%d batches)", ErrSpoolHeld, len(ids))
+		default:
+			if reason := s.diskTooFull(len(buf)); reason != "" {
+				return nil, fmt.Errorf("%w (%s)", ErrSpoolHeld, reason)
+			}
 		}
-	}
-	buf, err := json.Marshal(b)
-	if err != nil {
-		return nil, err
 	}
 	tmp := s.path(b.ID) + ".tmp"
 	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
@@ -291,6 +323,10 @@ type Config struct {
 	// (default: "local" next to the spool) for LocalRetentionDays (default 7).
 	LocalDir           string `json:"localDir,omitempty"`
 	LocalRetentionDays int    `json:"localRetentionDays,omitempty"`
+	// SpoolMinFreePercent: while the platform refuses the key, stop recording
+	// new batches before the spool's filesystem drops below this share free
+	// (default 10). Stored batches are never deleted for it.
+	SpoolMinFreePercent float64 `json:"spoolMinFreePercent,omitempty"`
 }
 
 // EdgeProblems checks the security settings, for static and agent mode
@@ -306,6 +342,9 @@ func (c Config) EdgeProblems(allowInsecureLocalhost bool) []string {
 	problems = append(problems, c.GuardBand.Problems()...)
 	if _, err := ParseControllerNetworks(c.ControllerNetworks); err != nil {
 		problems = append(problems, err.Error())
+	}
+	if p := c.SpoolMinFreePercent; p != 0 && (p < 1 || p > 90) {
+		problems = append(problems, fmt.Sprintf("spoolMinFreePercent %g: use 1 to 90 (default 10)", p))
 	}
 	if !ValidSyncPolicy(c.SyncPolicy) {
 		problems = append(problems, fmt.Sprintf("syncPolicy %q: use full, aggregated or local_only", c.SyncPolicy))
