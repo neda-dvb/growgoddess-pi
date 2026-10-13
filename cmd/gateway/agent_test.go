@@ -99,3 +99,67 @@ func TestObservedCapabilities(t *testing.T) {
 		t.Fatalf("unknown = %v", on.Unknown)
 	}
 }
+
+// TestCommandHostValidation: a command reaches only an address inside the
+// gateway's controller networks or one its own scan found, whatever the
+// backend sends; a refused address is refused before any network call.
+func TestCommandHostValidation(t *testing.T) {
+	now := time.Date(2026, 10, 14, 10, 0, 0, 0, time.UTC)
+	nets, err := gateway.ParseControllerNetworks([]string{"192.168.2.0/24"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := &hostSet{}
+	g := commandGates{AllowControl: false, Discovered: found,
+		HostAllowed: func(h string) bool { return gateway.HostInNetworks(h, nets) || found.has(h) }}
+	refused := "the controller address is outside this gateway's controller networks"
+	for _, host := range []string{"8.8.8.8", "127.0.0.1", "192.168.3.7", "evil.example.com", "169.254.169.254"} {
+		for _, kind := range []string{"test", "read_settings", "set_setpoint"} {
+			ok, _, msg := performCommand(agentCommand{Kind: kind, Controller: agentController{Vendor: "opticlimate", Host: host},
+				Payload: map[string]any{"setpoint": "temp_day", "value": 25.0}}, g, now)
+			if ok || msg != refused {
+				t.Errorf("%s to %s: ok=%v %q, want refused", kind, host, ok, msg)
+			}
+		}
+	}
+	// inside the network: the host gate passes and the next gate speaks
+	ok, _, msg := performCommand(agentCommand{Kind: "set_setpoint", Controller: agentController{Vendor: "opticlimate", Host: "192.168.2.110"},
+		Payload: map[string]any{"setpoint": "temp_day", "value": 25.0}}, g, now)
+	if ok || msg != "control is disabled on this gateway (allowControl is off)" {
+		t.Fatalf("a host in the network must pass the host gate, got %v %q", ok, msg)
+	}
+	// a box the gateway found itself is reachable even outside the list
+	found.add("192.168.3.7")
+	_, _, msg = performCommand(agentCommand{Kind: "set_setpoint", Controller: agentController{Vendor: "opticlimate", Host: "192.168.3.7"},
+		Payload: map[string]any{"setpoint": "temp_day", "value": 25.0}}, g, now)
+	if msg == refused {
+		t.Fatal("a discovered box must pass the host gate")
+	}
+	// no host function: every address is refused
+	if _, _, msg := performCommand(agentCommand{Kind: "test", Controller: agentController{Vendor: "opticlimate", Host: "192.168.2.110"}}, commandGates{}, now); msg != refused {
+		t.Fatalf("missing host gate must refuse, got %q", msg)
+	}
+}
+
+// TestGuardBandRefusalOnTheGateway: with control on, a setpoint outside the
+// gateway's own band is refused even though the backend asked for it.
+func TestGuardBandRefusalOnTheGateway(t *testing.T) {
+	now := time.Date(2026, 10, 14, 10, 0, 0, 0, time.UTC)
+	g := testGates(true)
+	// 192.0.2.1 (TEST-NET) answers nothing: a refusal here can only come from the band
+	for _, c := range []struct {
+		key   string
+		value float64
+	}{{"temp_day", 35}, {"temp_night", 10}, {"rh_day", 95}, {"rh_night", 20}} {
+		ok, _, msg := performCommand(agentCommand{Kind: "set_setpoint", Controller: agentController{Vendor: "opticlimate", Host: "192.0.2.1"},
+			Payload: map[string]any{"setpoint": c.key, "value": c.value}}, g, now)
+		if ok || !strings.Contains(msg, "outside the gateway's guard band") {
+			t.Errorf("%s=%g: ok=%v %q, want a guard band refusal", c.key, c.value, ok, msg)
+		}
+	}
+	g.Band = gateway.GuardBand{TempMin: 20, TempMax: 26}
+	if _, _, msg := performCommand(agentCommand{Kind: "set_setpoint", Controller: agentController{Vendor: "opticlimate", Host: "192.0.2.1"},
+		Payload: map[string]any{"setpoint": "temp_day", "value": 27.0}}, g, now); !strings.Contains(msg, "guard band") {
+		t.Errorf("a configured band applies, got %q", msg)
+	}
+}
