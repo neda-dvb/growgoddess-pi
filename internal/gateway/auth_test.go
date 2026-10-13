@@ -134,3 +134,20 @@ func TestWriteKeyFile(t *testing.T) {
 		t.Fatalf("no temporary files left: %v", entries)
 	}
 }
+
+// A restart while the spool holds more than its normal bound (a backlog from
+// an unauthorised spell, then a fresh enroll and restart) drops nothing.
+func TestRestartWithBacklogDropsNothing(t *testing.T) {
+	s := spoolOf(t, 3, 0)
+	s.SetHold(true)
+	for i := 1; i <= 5; i++ {
+		put(t, s, i)
+	}
+	again, err := NewSpool(s.Dir, 3) // a new process: no hold, no memory
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dropped, err := put(t, again, 6); err != nil || len(dropped) != 0 {
+		t.Fatalf("the backlog must survive a restart: dropped %v err %v", dropped, err)
+	}
+}

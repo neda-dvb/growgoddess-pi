@@ -145,7 +145,15 @@ func NewSpool(dir string, maxBatches int) (*Spool, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	return &Spool{Dir: dir, MaxBatches: maxBatches}, nil
+	s := &Spool{Dir: dir, MaxBatches: maxBatches}
+	// more than the normal bound on disk can only be a held backlog (from an
+	// unauthorised spell before a restart): keep it until it drains
+	ids, err := s.Pending()
+	if err != nil {
+		return nil, err
+	}
+	s.backlog = len(ids) > maxBatches
+	return s, nil
 }
 
 func (s *Spool) path(id string) string {
