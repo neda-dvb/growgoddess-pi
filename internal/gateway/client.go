@@ -31,7 +31,25 @@ type Client struct {
 
 func NewClient(api, planID, key, label string) *Client {
 	return &Client{API: api, PlanID: planID, Key: key, Label: label,
-		HTTP: &http.Client{Timeout: 30 * time.Second}}
+		HTTP: NewAPIHTTPClient(30 * time.Second)}
+}
+
+// APITransport carries every platform API call (nil: the default); tests
+// point it at a TLS test server.
+var APITransport http.RoundTripper
+
+// NewAPIHTTPClient is the client for every call to the platform. It follows
+// no redirect: the key (or an enrollment code) goes to the configured URL and
+// nowhere else, never on to plain http or another host. A redirect is an
+// error, so a batch stays spooled.
+func NewAPIHTTPClient(timeout time.Duration) *http.Client {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	return &http.Client{Timeout: timeout, Transport: APITransport,
+		CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+			return fmt.Errorf("the platform redirected to %s; redirects are not followed", req.URL.Redacted())
+		}}
 }
 
 // Send transmits one spooled batch. A non-nil error means "keep it spooled

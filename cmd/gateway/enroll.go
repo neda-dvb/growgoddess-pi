@@ -108,7 +108,7 @@ func runEnroll(args []string, stdout, stderr io.Writer) int {
 func redeemEnrollment(api, code string) (enrollResult, error) {
 	body, _ := json.Marshal(map[string]string{"code": code})
 	url := strings.TrimRight(api, "/") + "/api/pro/gateways/enroll"
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Post(url, "application/json", bytes.NewReader(body))
+	resp, err := gateway.NewAPIHTTPClient(30*time.Second).Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return enrollResult{}, err
 	}

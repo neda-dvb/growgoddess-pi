@@ -139,7 +139,7 @@ func fetchGatewayConfig(api, planID, key string) (agentConfigResp, error) {
 		return agentConfigResp{}, err
 	}
 	req.Header.Set("X-Api-Key", key)
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	resp, err := gateway.NewAPIHTTPClient(10 * time.Second).Do(req)
 	if err != nil {
 		return agentConfigResp{}, err
 	}
@@ -448,7 +448,7 @@ func fetchGatewayCommands(api, planID, key string) ([]agentCommand, error) {
 		return nil, err
 	}
 	req.Header.Set("X-Api-Key", key)
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	resp, err := gateway.NewAPIHTTPClient(10 * time.Second).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -507,7 +507,7 @@ func postGatewayResult(api, planID, key, commandID string, ok bool, result map[s
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Api-Key", key)
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	resp, err := gateway.NewAPIHTTPClient(10 * time.Second).Do(req)
 	if err != nil {
 		log.Printf("agent: post result for %s: %v", commandID, err)
 		return
@@ -567,7 +567,7 @@ func postControllerJSON(api, planID, key, what string, body map[string]any) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Api-Key", key)
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	resp, err := gateway.NewAPIHTTPClient(10 * time.Second).Do(req)
 	if err != nil {
 		log.Printf("agent: report %s: %v", what, err)
 		return
@@ -729,7 +729,7 @@ func rotateKey(api, planID, current, keyPath string) (string, error) {
 			return nil, err
 		}
 		req.Header.Set("X-Api-Key", key)
-		return (&http.Client{Timeout: 15 * time.Second}).Do(req)
+		return gateway.NewAPIHTTPClient(15 * time.Second).Do(req)
 	}
 	resp, err := call(base, current)
 	if err != nil {
