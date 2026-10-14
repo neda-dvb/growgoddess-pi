@@ -13,6 +13,7 @@ package gateway
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/netip"
 	"net/url"
 	"strings"
@@ -97,6 +98,9 @@ func (b GuardBand) Problems() []string {
 // Check refuses a setpoint value outside the band. Temperature setpoints
 // start with temp_, humidity ones with rh_; any other key is refused.
 func (b GuardBand) Check(key string, value float64) error {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return fmt.Errorf("%w: %v is not a number", ErrOutsideGuardBand, value)
+	}
 	e := b.Effective()
 	lo, hi, unit := 0.0, 0.0, ""
 	switch {

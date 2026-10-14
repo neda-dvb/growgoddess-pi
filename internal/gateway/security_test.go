@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -136,5 +137,17 @@ func TestEdgeProblems(t *testing.T) {
 	bad := Config{API: "http://api.gateway-test.invalid", SyncPolicy: "everything", ControllerNetworks: []string{"0.0.0.0/0"}, GuardBand: GuardBand{TempMin: 40}}
 	if p := bad.EdgeProblems(true); len(p) != 4 {
 		t.Fatalf("want 4 problems (http, band, networks, policy), got %d: %v", len(p), p)
+	}
+}
+
+// NaN and infinities are never inside a band (NaN compares false both ways).
+func TestGuardBandRefusesNaNAndInf(t *testing.T) {
+	var band GuardBand
+	for _, v := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		for _, key := range []string{"temp_day", "rh_night"} {
+			if err := band.Check(key, v); !errors.Is(err, ErrOutsideGuardBand) {
+				t.Errorf("%s=%v: %v, want ErrOutsideGuardBand", key, v, err)
+			}
+		}
 	}
 }
