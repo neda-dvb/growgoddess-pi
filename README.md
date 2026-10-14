@@ -181,7 +181,8 @@ The gateway refuses these on its own, whatever the backend or a config asks:
 
 - **https only.** The API URL must be `https://`; the gateway stops at
   startup otherwise. Plain `http://` works only for a backend on localhost,
-  with `-insecure-localhost` (development).
+  with `-insecure-localhost` (development). A redirect from the platform is
+  never followed, so the key goes nowhere but the configured URL.
 - **Guard band.** A setpoint outside `guardBand` in `gateway.json` (default
   15 to 32 °C and 30 to 85 %RH) is refused before the controller is touched,
   even with `allowControl: true` and even when the platform asks.
