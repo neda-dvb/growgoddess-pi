@@ -174,13 +174,13 @@ func NewSpool(dir string, maxBatches int) (*Spool, error) {
 		return nil, err
 	}
 	s := &Spool{Dir: dir, MaxBatches: maxBatches}
-	// more than the normal bound on disk can only be a held backlog (from an
+	// the normal bound or more on disk can only be a held backlog (from an
 	// unauthorised spell before a restart): keep it until it drains
 	ids, err := s.Pending()
 	if err != nil {
 		return nil, err
 	}
-	s.backlog = len(ids) > maxBatches
+	s.backlog = len(ids) >= maxBatches
 	return s, nil
 }
 

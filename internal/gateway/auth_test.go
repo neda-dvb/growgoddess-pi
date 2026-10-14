@@ -200,3 +200,19 @@ func TestHeldSpoolStopsBeforeTheDiskFills(t *testing.T) {
 		t.Fatalf("a floor above 90%% is a config problem: %v", problems)
 	}
 }
+
+// A restart with exactly MaxBatches on disk drops nothing either.
+func TestRestartAtTheBoundDropsNothing(t *testing.T) {
+	s := spoolOf(t, 3, 0)
+	s.SetHold(true)
+	for i := 1; i <= 3; i++ {
+		put(t, s, i)
+	}
+	again, err := NewSpool(s.Dir, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dropped, err := put(t, again, 4); err != nil || len(dropped) != 0 {
+		t.Fatalf("a spool at its bound must survive a restart: dropped %v err %v", dropped, err)
+	}
+}
